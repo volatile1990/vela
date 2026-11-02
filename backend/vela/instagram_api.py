@@ -99,6 +99,7 @@ class _NetworkGuard:
         self.checkpoint_url = None
         self.challenge = self.rate_limited = self.network_failed = False
         self.explicit_expired = False
+        self.feedback = self.auth_rejected = False
 
     def check(self):
         if self.stop_event is not None and self.stop_event.is_set():
@@ -168,7 +169,11 @@ class _NetworkGuard:
                             if not candidate and isinstance(challenge, dict):
                                 candidate = challenge.get("url") or challenge.get("api_path")
                             guard.checkpoint_url = safe_checkpoint_url(candidate) or guard.checkpoint_url
-                            guard.challenge |= bool(challenge or data.get("checkpoint_url")) or data.get("message") in {"challenge_required", "checkpoint_required", "feedback_required"}
+                            guard.challenge |= bool(challenge or data.get("checkpoint_url")) or data.get("message") in {"challenge_required", "checkpoint_required"}
+                            guard.feedback |= data.get("message") == "feedback_required"
+                            guard.auth_rejected |= data.get("authenticated") is False
+                            if guard.phase in {"login", "totp"}:
+                                guard.auth_rejected |= guard.challenge or guard.feedback
                             if guard.phase == "verify":
                                 user_data = data.get("data")
                                 guard.explicit_expired |= data.get("message") == "login_required" or (response.status_code == 200 and data.get("status") in {None, "ok"} and not data.get("errors") and isinstance(user_data, dict) and "user" in user_data and user_data["user"] is None)
@@ -225,8 +230,9 @@ class InstagramApiClient:
             raise InstagramApiStorageError()
         return account["username"]
 
-    def _verify(self, loader, guard, username, cookies, request_id, attempted, user_agent, checkpoint=None, was_ready=False):
-        self._save(username, cookies, "ready" if was_ready else "verification", request_id, attempted, user_agent, checkpoint)
+    def _verify(self, loader, guard, username, cookies, request_id, attempted, user_agent, checkpoint=None, was_ready=False, was_authenticated=False):
+        provenance = "ready" if was_ready else "api_authenticated" if was_authenticated else "verification"
+        self._save(username, cookies, provenance, request_id, attempted, user_agent, checkpoint)
         if not cookies.get("sessionid"):
             return self._result("needs_attention", "confirmation_required", cookies, checkpoint, user_agent)
         loader.context.user_agent = user_agent
@@ -235,13 +241,21 @@ class InstagramApiClient:
         guard.check()
         identity = loader.test_login()
         updated = self._snapshot(loader, guard, cookies)
-        if isinstance(identity, str) and identity.casefold() == username.casefold():
+        if isinstance(identity, str) and identity.casefold() == username.casefold() and not (guard.challenge or guard.checkpoint_url or guard.auth_rejected):
             self._save(username, updated, "ready", request_id, attempted, user_agent)
             return self._result("ready", "session_ready", updated, user_agent=user_agent)
         checkpoint = guard.checkpoint_url or checkpoint
-        reason = "challenge_required" if guard.challenge else "rate_limited" if guard.rate_limited else "network_error" if guard.network_failed else "identity_mismatch" if isinstance(identity, str) else "session_expired" if was_ready and guard.explicit_expired else "verification_required"
-        self._save(username, updated, "checkpoint" if checkpoint or guard.challenge else "blocked" if reason == "identity_mismatch" else "ready" if was_ready else "verification", request_id, attempted, user_agent, checkpoint)
-        return self._result("error" if reason == "identity_mismatch" else "needs_attention", reason, updated, checkpoint, user_agent)
+        # GraphQL may reject a freshly authenticated download session with
+        # feedback_required. This is usable only with durable login provenance;
+        # it proves neither an unknown session nor a different browser account.
+        feedback_only = guard.feedback and identity is None and not (guard.challenge or checkpoint or guard.rate_limited or guard.network_failed or guard.explicit_expired or guard.auth_rejected)
+        if feedback_only and provenance in {"ready", "api_authenticated"}:
+            self._save(username, updated, "ready", request_id, attempted, user_agent)
+            return self._result("ready", "session_ready", updated, user_agent=user_agent)
+        reason = "challenge_required" if guard.challenge or guard.checkpoint_url else "rate_limited" if guard.rate_limited else "network_error" if guard.network_failed else "authentication_rejected" if guard.auth_rejected else "identity_mismatch" if isinstance(identity, str) else "feedback_required" if guard.feedback else "session_expired" if was_ready and guard.explicit_expired else "verification_required"
+        pending_stage = "checkpoint" if checkpoint or guard.challenge else "blocked" if reason in {"identity_mismatch", "authentication_rejected"} else "verification" if guard.explicit_expired and not was_ready else provenance
+        self._save(username, updated, pending_stage, request_id, attempted, user_agent, checkpoint)
+        return self._result("error" if reason in {"identity_mismatch", "feedback_required", "authentication_rejected"} else "needs_attention", reason, updated, checkpoint, user_agent)
 
     def refresh(self, account: dict, request_id: int, state_callbacks, *, stop_event=None) -> ApiResult:
         loader = None
@@ -270,7 +284,7 @@ class InstagramApiClient:
                         loader.load_session(username, cookies)
                         loader.context.two_factor_auth_pending = (loader.context._session, username, identifier)
                     else:
-                        result = self._verify(loader, guard, username, cookies, request_id, attempted, user_agent, checkpoint, was_ready=stage=="ready")
+                        result = self._verify(loader, guard, username, cookies, request_id, attempted, user_agent, checkpoint, was_ready=stage=="ready", was_authenticated=stage=="api_authenticated")
                         if stage != "ready" or result.reason != "session_expired":
                             return result
                         # Only a formerly verified session with an explicit
@@ -301,7 +315,10 @@ class InstagramApiClient:
                         self._save(username, cookies, stage, request_id, False, user_agent, identifier=identifier)
                     else:
                         cookies = self._snapshot(loader, guard)
-                        return self._verify(loader, guard, username, cookies, request_id, False, user_agent)
+                        if guard.auth_rejected:
+                            raise _ApiStop("challenge_required" if guard.challenge else "feedback_required" if guard.feedback else "authentication_rejected")
+                        stage = "api_authenticated" if cookies.get("sessionid") else "verification"
+                        return self._verify(loader, guard, username, cookies, request_id, False, user_agent, was_authenticated=stage=="api_authenticated")
                 if not account.get("totp_secret"):
                     return self._result("needs_attention", "two_factor_required", cookies, checkpoint, user_agent)
                 if not state_callbacks.consume_totp_attempt(request_id):
@@ -317,18 +334,20 @@ class InstagramApiClient:
                 finally:
                     del code
                 cookies = self._snapshot(loader, guard, cookies)
-                stage = "verification"
-                return self._verify(loader, guard, username, cookies, request_id, attempted, user_agent, checkpoint)
+                if guard.auth_rejected:
+                    raise _ApiStop("challenge_required" if guard.challenge else "feedback_required" if guard.feedback else "authentication_rejected")
+                stage = "api_authenticated" if cookies.get("sessionid") else "verification"
+                return self._verify(loader, guard, username, cookies, request_id, attempted, user_agent, checkpoint, was_authenticated=stage=="api_authenticated")
         except InstagramApiStorageError:
             return self._result("error", "storage_error")
         except Exception as error:
-            reason = error.reason if isinstance(error, _ApiStop) else "two_factor_rejected" if isinstance(error, instaloader.BadCredentialsException) and attempted else "credentials_rejected" if isinstance(error, instaloader.BadCredentialsException) else "challenge_required" if guard.challenge else "rate_limited" if guard.rate_limited else "network_error" if guard.network_failed or isinstance(error, requests.exceptions.RequestException) else "api_error"
+            reason = error.reason if isinstance(error, _ApiStop) else "challenge_required" if guard.challenge else "feedback_required" if guard.feedback else "two_factor_rejected" if isinstance(error, instaloader.BadCredentialsException) and attempted else "credentials_rejected" if isinstance(error, instaloader.BadCredentialsException) else "rate_limited" if guard.rate_limited else "network_error" if guard.network_failed or isinstance(error, requests.exceptions.RequestException) else "api_error"
             if loader is not None and username:
                 with suppress(Exception):
                     cookies = self._snapshot(loader, guard, cookies)
                     checkpoint = guard.checkpoint_url or checkpoint
-                    self._save(username, cookies, "checkpoint" if checkpoint or guard.challenge else stage if stage in {"two_factor", "ready"} else "blocked" if reason == "credentials_rejected" else "verification", request_id, attempted, user_agent, checkpoint, identifier if stage == "two_factor" else None)
-            return self._result("error" if reason in {"credentials_rejected", "two_factor_rejected", "network_policy_blocked", "cancelled"} else "needs_attention", reason, cookies, checkpoint, user_agent)
+                    self._save(username, cookies, "checkpoint" if checkpoint or guard.challenge else stage if stage in {"two_factor", "ready", "api_authenticated"} else "blocked" if reason in {"credentials_rejected", "feedback_required", "authentication_rejected"} else "verification", request_id, attempted, user_agent, checkpoint, identifier if stage == "two_factor" else None)
+            return self._result("error" if reason in {"credentials_rejected", "two_factor_rejected", "network_policy_blocked", "cancelled", "feedback_required", "authentication_rejected"} else "needs_attention", reason, cookies, checkpoint, user_agent)
         finally:
             if loader is not None:
                 with suppress(Exception):
@@ -353,16 +372,18 @@ class InstagramApiClient:
             user_agent = saved.user_agent if saved and saved.user_agent else loader.context.user_agent
             checkpoint = saved.checkpoint_url if saved else None
             with guard:
+                same_session = saved is not None and saved.cookies.get("sessionid") == values.get("sessionid")
                 return self._verify(loader, guard, username, values, saved.request_id if saved else 0,
-                    saved.totp_attempted if saved else False, user_agent, checkpoint)
+                    saved.totp_attempted if saved else False, user_agent, checkpoint,
+                    was_ready=same_session and saved.pending_stage=="ready", was_authenticated=same_session and saved.pending_stage=="api_authenticated")
         except InstagramApiStorageError:
             return self._result("error", "storage_error")
         except Exception as error:
-            reason = error.reason if isinstance(error, _ApiStop) else "challenge_required" if guard.challenge else "rate_limited" if guard.rate_limited else "network_error" if guard.network_failed else "api_error"
+            reason = error.reason if isinstance(error, _ApiStop) else "challenge_required" if guard.challenge else "feedback_required" if guard.feedback else "rate_limited" if guard.rate_limited else "network_error" if guard.network_failed else "api_error"
             with suppress(Exception):
                 self._save(username, values, "checkpoint" if guard.checkpoint_url or checkpoint else "verification",
                     saved.request_id if saved else 0, saved.totp_attempted if saved else False, user_agent, guard.checkpoint_url or checkpoint)
-            return self._result("needs_attention", reason, values, guard.checkpoint_url or checkpoint, user_agent)
+            return self._result("error" if reason == "feedback_required" else "needs_attention", reason, values, guard.checkpoint_url or checkpoint, user_agent)
         finally:
             if loader is not None:
                 with suppress(Exception):

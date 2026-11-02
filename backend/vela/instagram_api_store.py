@@ -11,7 +11,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
-STAGES = frozenset({"login_pending", "two_factor", "verification", "checkpoint", "ready", "blocked"})
+STAGES = frozenset({"login_pending", "two_factor", "api_authenticated", "verification", "checkpoint", "ready", "blocked"})
 MAX_PAYLOAD = 12288
 _PREFIX = b"VELAIGAPI1"
 _AAD = b"vela.instagram.api.session.v1"

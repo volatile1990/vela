@@ -66,6 +66,8 @@ class Transport:
                 raise requests.Timeout("synthetic-private-url-and-password")
             if self.login == "bad":
                 data.update(authenticated=False, user=True)
+            elif self.login == "feedback":
+                data.update(status="fail", message="feedback_required")
             elif self.login == "challenge":
                 data.update(status="fail", checkpoint_url=CHECKPOINT)
             elif self.two_factor:
@@ -77,7 +79,11 @@ class Transport:
             if self.otp == "bad":
                 data.update(status="fail", message="synthetic-private-error")
             else:
-                session.cookies.set("sessionid", COOKIE)
+                if self.otp != "no_sid":session.cookies.set("sessionid", COOKIE)
+                if self.otp == "feedback":
+                    data.update(message="feedback_required")
+                elif self.otp == "denied":
+                    data.update(authenticated=False)
         elif path == "/graphql/query":
             if self.before_verify:
                 self.saw_before_verify = self.before_verify()
@@ -90,6 +96,12 @@ class Transport:
             elif verify == "rate":
                 response.status_code = 429
                 data.update(status="fail", message="synthetic-private-rate")
+            elif verify in {"feedback", "feedback_challenge", "feedback_expired", "feedback_denied"}:
+                response.status_code = 400
+                data.update(status="fail", message="feedback_required")
+                if verify == "feedback_challenge":data.update(challenge={"url":CHECKPOINT})
+                elif verify == "feedback_expired":data.update(data={"user":None})
+                elif verify == "feedback_denied":data.update(authenticated=False)
             elif verify == "login_required":
                 response.status_code = 401
                 data.update(status="fail", message="login_required")
@@ -98,6 +110,10 @@ class Transport:
                 response.headers["Location"] = "https://www.instagram.com/accounts/login/"
             elif verify == "unknown":
                 data["data"] = {}
+            elif verify in {"matched_challenge", "matched_denied"}:
+                data["data"]={"user":{"username":ACCOUNT["username"]}}
+                if verify=="matched_challenge":data["challenge"]={"url":CHECKPOINT}
+                else:data["authenticated"]=False
             else:
                 data["data"] = {"user": {"username": "synthetic-other-user" if verify == "other" else ACCOUNT["username"].upper()} if verify not in {"none", "expired"} else None}
         response._content = json.dumps(data).encode()
@@ -115,7 +131,7 @@ def test_success_persists_before_verification_and_reuses_session_without_credent
     transport.install(monkeypatch)
     result = client(store).refresh(ACCOUNT, request_id, state)
     assert result.state == "ready"
-    assert transport.saw_before_verify.pending_stage == "verification"
+    assert transport.saw_before_verify.pending_stage == "api_authenticated"
     assert transport.saw_before_verify.cookies["sessionid"] == COOKIE
     assert transport.saw_before_verify.totp_attempted
     assert store.load(ACCOUNT["username"]).pending_stage == "ready"
@@ -148,6 +164,99 @@ def test_accepted_two_factor_session_survives_failed_verify_then_resumes_without
     result = client(store).refresh(ACCOUNT, request_id, state)
     assert result.state == "ready"
     assert transport.calls[previous:] == [("GET", "/graphql/query")]
+
+
+@pytest.mark.parametrize("two_factor",[False,True])
+def test_feedback_only_on_graphql_accepts_proven_fresh_sdk_session(tmp_path,monkeypatch,two_factor):
+    _,store,state,request_id=setup(tmp_path)
+    transport=Transport(two_factor=two_factor,verify="feedback")
+    transport.before_verify=lambda:store.load(ACCOUNT["username"])
+    transport.install(monkeypatch)
+    result=client(store).refresh(ACCOUNT,request_id,state)
+    assert transport.saw_before_verify.pending_stage=="api_authenticated"
+    assert result.state=="ready" and result.reason=="session_ready"
+    assert any(cookie["name"]=="sessionid" and cookie["value"]==COOKIE for cookie in result.cookies)
+    assert store.load(ACCOUNT["username"]).pending_stage=="ready"
+    assert sum(path.endswith("login/ajax/") for _,path in transport.calls)==1
+    assert sum(path.endswith("ajax/two_factor/") for _,path in transport.calls)==int(two_factor)
+
+
+@pytest.mark.parametrize("stage",["ready","api_authenticated"])
+def test_feedback_only_resumes_durably_proven_session_without_auth_posts(tmp_path,monkeypatch,stage):
+    _,store,state,request_id=setup(tmp_path)
+    store.save(ACCOUNT["username"],cookies={"sessionid":COOKIE,"csrftoken":"synthetic-csrf"},pending_stage=stage)
+    transport=Transport(verify="feedback");transport.install(monkeypatch)
+    assert client(store).refresh(ACCOUNT,request_id,state).state=="ready"
+    assert transport.calls==[("GET","/graphql/query")]
+    assert state.consume_login_attempt(request_id)
+
+
+@pytest.mark.parametrize("stage",["login_pending","verification","checkpoint","blocked"])
+def test_unproven_feedback_is_static_error_and_never_promoted(tmp_path,monkeypatch,stage):
+    _,store,state,request_id=setup(tmp_path)
+    store.save(ACCOUNT["username"],cookies={"sessionid":COOKIE,"csrftoken":"synthetic-csrf"},pending_stage=stage)
+    transport=Transport(verify="feedback");transport.install(monkeypatch)
+    result=client(store).refresh(ACCOUNT,request_id,state)
+    assert result.state=="error" and result.reason=="feedback_required"
+    assert store.load(ACCOUNT["username"]).pending_stage not in {"ready","api_authenticated"}
+    assert transport.calls==[("GET","/graphql/query")]
+
+
+@pytest.mark.parametrize("login,otp,reason",[("feedback","ready","feedback_required"),("ready","feedback","feedback_required"),("ready","denied","authentication_rejected")])
+def test_auth_post_feedback_or_denied_authentication_never_creates_provenance(tmp_path,monkeypatch,login,otp,reason):
+    _,store,state,request_id=setup(tmp_path)
+    transport=Transport(login=login,otp=otp,verify="feedback");transport.install(monkeypatch)
+    result=client(store).refresh(ACCOUNT,request_id,state)
+    assert result.state=="error" and result.reason==reason
+    assert store.load(ACCOUNT["username"]).pending_stage not in {"ready","api_authenticated"}
+    assert not any(path=="/graphql/query" for _,path in transport.calls)
+
+
+def test_sdk_return_without_nonempty_sessionid_never_creates_login_provenance(tmp_path,monkeypatch):
+    _,store,state,request_id=setup(tmp_path)
+    transport=Transport(otp="no_sid",verify="feedback");transport.install(monkeypatch)
+    result=client(store).refresh(ACCOUNT,request_id,state)
+    assert result.state=="needs_attention"
+    assert store.load(ACCOUNT["username"]).pending_stage=="verification"
+    assert not any(path=="/graphql/query" for _,path in transport.calls)
+
+
+def test_real_challenge_cannot_be_promoted_by_simultaneous_feedback(tmp_path,monkeypatch):
+    _,store,state,request_id=setup(tmp_path)
+    transport=Transport(verify="feedback_challenge");transport.install(monkeypatch)
+    result=client(store).refresh(ACCOUNT,request_id,state)
+    assert result.state=="needs_attention" and result.reason=="challenge_required"
+    assert result.checkpoint_url==CHECKPOINT
+    assert store.load(ACCOUNT["username"]).pending_stage=="checkpoint"
+
+
+def test_feedback_with_explicit_authenticated_false_is_never_promoted(tmp_path,monkeypatch):
+    _,store,state,request_id=setup(tmp_path)
+    transport=Transport(verify="feedback_denied");transport.install(monkeypatch)
+    result=client(store).refresh(ACCOUNT,request_id,state)
+    assert result.state=="error" and result.reason=="authentication_rejected"
+    assert store.load(ACCOUNT["username"]).pending_stage=="blocked"
+
+
+@pytest.mark.parametrize("cached",[False,True])
+@pytest.mark.parametrize("verify,reason",[("matched_challenge","challenge_required"),("matched_denied","authentication_rejected")])
+def test_matching_identity_never_overrides_explicit_challenge_or_authentication_denial(tmp_path,monkeypatch,cached,verify,reason):
+    _,store,state,request_id=setup(tmp_path)
+    if cached:store.save(ACCOUNT["username"],cookies={"sessionid":COOKIE,"csrftoken":"synthetic-csrf"},pending_stage="ready")
+    transport=Transport(verify=verify);transport.install(monkeypatch)
+    result=client(store).refresh(ACCOUNT,request_id,state)
+    assert result.state!="ready" and result.reason==reason
+    assert store.load(ACCOUNT["username"]).pending_stage==("checkpoint" if verify=="matched_challenge" else "blocked")
+    assert sum(path.endswith("login/ajax/") for _,path in transport.calls)==int(not cached)
+
+
+def test_browser_session_with_changed_identity_token_does_not_inherit_provenance(tmp_path,monkeypatch):
+    _,store,_,_=setup(tmp_path)
+    store.save(ACCOUNT["username"],cookies={"sessionid":"synthetic-old-session","csrftoken":"synthetic-csrf"},pending_stage="ready")
+    transport=Transport(verify="feedback");transport.install(monkeypatch)
+    result=client(store).accept_browser_session(ACCOUNT,{"sessionid":COOKIE,"csrftoken":"synthetic-csrf"})
+    assert result.state=="error" and result.reason=="feedback_required"
+    assert store.load(ACCOUNT["username"]).pending_stage=="verification"
 
 
 @pytest.mark.parametrize("expired",["expired","login_required","login_redirect"])
