@@ -20,3 +20,9 @@ Stand 2. November 2026, Europe/Berlin. Produktiver Zugang: `https://vela.home.ar
 Die eigenen drei Testmedien und acht zugehörigen Smoke-Aufträge wurden nach Abnahme gezielt entfernt. Die Speichermarker bleiben erhalten. Eine Vorschau aus der Browserprüfung kann intern als Metadatensatz erhalten bleiben; sie ist kein gespeichertes Medium.
 
 NAS-Ausfall, unterbrochene Finalisierung und Prozessabbrüche wurden mit isolierten Tests geprüft. Ein vollständiger Heimserver-/Docker-Neustart und ein echter produktiver NAS-Ausfall wurden nicht ausgelöst. Für die ausdrücklich ungeschützten Downloadmedien werden keine zusätzlichen Backups eingerichtet.
+
+## Veröffentlichung
+
+Vela 1.0.0 ist in [Orbit](https://orbit.home.arpa/) veröffentlicht; Katalog und vollständiger Download wurden nach Freigabe geprüft. Paket: `vela-1.0.0-linux-x86_64.tar.gz`, 304.009.828 Byte, SHA-256 `efaa5d99f3b50fb9b460225f41d8240feebfaa212ce07b0d48905fbe24a1a5a6`.
+
+Die geprüfte Paketquelle ist Commit `4ce1fec8134d7eccd0c87aabdd7507597e7fdead`. Laufende Images: API `sha256:02dd0ece4a4af8aef1b4ba402efec0108859f21310f1fa687e86c511eaa0e3a1`, Worker `sha256:e0b8ef01ebff62bbde9f76a1a5b8cc2893e228f6af3b9c16890a8594ea9287a5`. Beide Container meldeten nach der abschließenden Bereitstellung `healthy`.

@@ -12,6 +12,8 @@ Downloadziel ist `\\unas.home.arpa\Unprotected\Vela`, ein eigener Unterordner de
 
 Vela läuft unter **[https://vela.home.arpa/](https://vela.home.arpa/)** und ist in NEXUS verlinkt. Am 2. November 2026 wurden Vorschau, Video, Audio und ein öffentlicher YouTube-Download bis zur Datei auf dem UNAS einschließlich Hashprüfung bestätigt. Der Worker-Neustart ließ die API ohne Ausfall erreichbar. Die Linux-Prüfung besteht aus 61 Tests, die Frontend-Prüfung aus 12 Tests.
 
+Version **1.0.0** ist im lokalen **[Orbit](https://orbit.home.arpa/)** veröffentlicht. Das Linux-x86_64-Paket enthält die gebauten Containerimages und Quellen für den vorbereiteten Heimserver; öffentlicher Katalog und vollständiger Paketdownload wurden geprüft.
+
 ## Entwicklung und Prüfung
 
 Voraussetzungen: Python ab 3.12, SQLite mit WAL-reset-Fix und Node.js 24.13 oder kompatibel. Die Container stellen die passende SQLite-Bibliothek bereit. Für echte Downloads werden zusätzlich yt-dlp mit EJS, Deno und FFmpeg benötigt.
