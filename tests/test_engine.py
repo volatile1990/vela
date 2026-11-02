@@ -192,3 +192,61 @@ def test_real_ffprobe_accepts_h264_and_rejects_other_video_codecs(tmp_path):
     with pytest.raises(EngineError) as error:
         asyncio.run(Engine().verify_compatible(incompatible, tmp_path))
     assert error.value.category == "format"
+
+
+@pytest.mark.parametrize("message,category", [
+    ("This content isn't available to everyone: It can't be seen by certain audiences.", "audience_restricted"),
+    ("This content isn’t available to everyone", "audience_restricted"),
+    ("The webpage request was redirected to the login page. You have exceeded the rate-limit for accessing posts anonymously", "rate_limited"),
+    ("HTTP Error 429: Too Many Requests", "rate_limited"),
+    ("Please wait a few minutes before you try again", "rate_limited"),
+    ("You need to log in to access this content", "login_required"),
+    ("This content is only available for registered users who follow this account", "login_required"),
+    ("Login is required to access this video", "login_required"),
+    ("HTTP Error 403: Forbidden", "access_denied"),
+    ("HTTP Error 404: Not Found", "not_found"),
+    ("HTTP Error 410: Gone", "not_found"),
+    ("This video has been removed", "not_found"),
+    ("This video is unavailable", "unavailable"),
+    ("There is no video in this post", "no_media"),
+    ("Requested format is not available", "format"),
+    ("Instagram sent an empty media response", "extractor"),
+    ("Unable to extract shared data", "extractor"),
+    ("HTTP Error 503: Service Unavailable", "network"),
+    ("Connection timed out", "network"),
+    ("Temporary failure in name resolution", "network"),
+    ("No space left on device", "storage"),
+    ("Unsupported URL: synthetic source", "unsupported_url"),
+    ("This video is DRM protected", "drm_protected"),
+    ("This video is not available in your country", "geo_restricted"),
+])
+def test_source_error_categories_are_precise_and_case_insensitive(message, category):
+    assert Engine._error_category(message) == category
+    assert Engine._error_category(message.upper()) == category
+
+
+def test_cookie_hint_alone_does_not_claim_login_is_required():
+    assert Engine._error_category("Unexpected response. See --cookies-from-browser documentation") == "download"
+
+
+def test_audience_error_is_static_and_does_not_expose_remote_diagnostics(tmp_path):
+    script = tmp_path / "restricted.py"
+    script.write_text("import sys\n"
+        "sys.stderr.write(\"error: [Instagram] This content isn't available to everyone: It can't be seen by certain audiences. https://example.invalid/?token=synthetic-secret\\n\")\n"
+        "sys.stderr.write('ERROR: Final extractor attempt failed\\n')\n"
+        "sys.exit(1)\n", encoding="utf-8")
+
+    async def receive(_):
+        pass
+
+    with pytest.raises(EngineError) as error:
+        asyncio.run(Engine()._run([sys.executable, str(script)], tmp_path, receive, None, 5))
+    assert error.value.category == "audience_restricted"
+    message = str(error.value)
+    assert "Instagram" in message
+    assert "Alters-" in message and "Regionsfreigabe" in message
+    assert "privat" not in message.lower()
+    assert "example.invalid" not in message
+    assert "synthetic-secret" not in message
+    assert "certain audiences" not in message
+    assert error.value.__cause__ is None

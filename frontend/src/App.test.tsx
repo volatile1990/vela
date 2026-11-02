@@ -23,6 +23,7 @@ function backend(existingJobs: Job[] = [], workerStatus = 'running') {
     const url = String(input);
     if (url === '/api/session') return json(serverInfo);
     if (url === '/api/overview') return json(overview(workerStatus));
+    if (url === '/api/source-sessions') return json({ items: [] });
     if (url.startsWith('/api/jobs?')) return json({ items: existingJobs, total: existingJobs.length });
     if (url === '/api/jobs' && init?.method === 'POST') return json(job(JSON.parse(String(init.body)) as Partial<Job>), 202);
     if (url === '/api/previews') return json(job({ kind: 'probe', status: 'completed', title: 'Meine Aufnahme', metadata: { title: 'Meine Aufnahme', duration: 125, thumbnail: 'https://external.example/private.jpg' } }), 202);
@@ -165,5 +166,15 @@ describe('Vela-Arbeitsabläufe', () => {
     await user.click(screen.getByRole('button', { name: 'Verlauf' }));
     await user.click(await screen.findByRole('button', { name: 'Download wiederholen: Eigene Aufnahme' }));
     expect(fetchMock).toHaveBeenCalledWith('/api/jobs/job-1/retry', expect.objectContaining({ method: 'POST' }));
+  });
+
+  it('führt bei einer Zielgruppenbeschränkung direkt zu den passenden Quellsitzungen', async () => {
+    backend([job({ status: 'failed', url: 'https://www.instagram.com/reel/example', title: 'Eigene Aufnahme', error: 'Die Quelle verlangt eine passende Sitzung.', error_code: 'audience_restricted' })]);
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Sitzung hinterlegen' }));
+    expect(await screen.findByRole('heading', { name: 'Sitzungen für Quellen' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Instagram/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.queryByLabelText('Passwort')).not.toBeInTheDocument();
   });
 });

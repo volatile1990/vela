@@ -16,9 +16,14 @@ services:
     environment:
       VELA_BASE_URL: https://vela.home.arpa
       VELA_FRONTEND_DIR: /app/frontend/dist
+      VELA_CREDENTIALS_DIR: /credentials
       VELA_STORAGE_MARKER: vela-unas-unprotected-698f83b4-014e-482f-8aa1-d5a75e65b39a
       VELA_TRUSTED_PROXIES: 172.29.50.0/28
     volumes:
+      - type: bind
+        source: /srv/vela/credentials
+        target: /credentials
+        bind: {create_host_path: false}
       - type: bind
         source: /srv/vela/state
         target: /state
@@ -55,11 +60,17 @@ services:
     cpus: 1
     pids_limit: 128
     environment:
+      VELA_CREDENTIALS_DIR: /credentials
       VELA_STORAGE_MARKER: vela-unas-unprotected-698f83b4-014e-482f-8aa1-d5a75e65b39a
       VELA_MAX_WORK_BYTES: "17179869184"
       VELA_MIN_FREE_BYTES: "2147483648"
       VELA_MAX_PLAYLIST_ITEMS: "100"
     volumes:
+      - type: bind
+        source: /srv/vela/credentials
+        target: /credentials
+        read_only: true
+        bind: {create_host_path: false}
       - type: bind
         source: /srv/vela/state
         target: /state

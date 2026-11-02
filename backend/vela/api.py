@@ -22,6 +22,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from . import __version__
 from .config import Settings
 from .db import Database
+from .source_sessions import MAX_COOKIE_BYTES, SOURCE_SITES, SourceSessionError, SourceSessionStore
 
 
 class JobInput(BaseModel):
@@ -144,6 +145,7 @@ def _safe_file(settings: Settings, relative_path: str):
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     database = Database(settings.db_path)
+    source_sessions = SourceSessionStore(settings.credentials_dir)
 
     @asynccontextmanager
     async def lifespan(application):
@@ -185,6 +187,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def current_session():
         # Kept as a lightweight capability response for existing browser clients.
         return {"authenticated": True, "username": None, "csrf_token": None, "version": __version__}
+
+    @app.exception_handler(SourceSessionError)
+    async def source_session_error(request: Request, error: SourceSessionError):
+        return JSONResponse({"detail": str(error)}, status_code=error.status_code)
+
+    @app.get("/api/source-sessions")
+    def list_source_sessions():
+        return {"items": source_sessions.items()}
+
+    @app.put("/api/source-sessions/{site}")
+    async def import_source_session(site: str, request: Request):
+        if site not in SOURCE_SITES:
+            raise HTTPException(404, "Diese Quellseite wird nicht unterstützt.")
+        if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "text/plain":
+            raise HTTPException(415, "Bitte eine Cookies-Datei als einfachen UTF-8-Text übertragen.")
+        length = request.headers.get("content-length")
+        if length is not None:
+            try:
+                size = int(length)
+            except ValueError:
+                raise HTTPException(400, "Die angegebene Dateigröße ist ungültig.") from None
+            if size < 0 or size > MAX_COOKIE_BYTES:
+                raise HTTPException(413, "Die Cookies-Datei darf höchstens 256 KiB groß sein.")
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > MAX_COOKIE_BYTES:
+                raise HTTPException(413, "Die Cookies-Datei darf höchstens 256 KiB groß sein.")
+            body.extend(chunk)
+        try:
+            text = body.decode("utf-8")
+        except UnicodeError:
+            raise HTTPException(422, "Die Cookies-Datei muss gültigen UTF-8-Text enthalten.") from None
+        try:
+            return await asyncio.to_thread(source_sessions.import_text, site, text)
+        except OSError:
+            raise HTTPException(503, "Der Sitzungsspeicher ist derzeit nicht verfügbar.") from None
+
+    @app.delete("/api/source-sessions/{site}")
+    def delete_source_session(site: str):
+        try:
+            source_sessions.delete(site)
+        except OSError:
+            raise HTTPException(503, "Der Sitzungsspeicher ist derzeit nicht verfügbar.") from None
+        return {"ok": True}
 
     @app.get("/api/overview")
     def overview():

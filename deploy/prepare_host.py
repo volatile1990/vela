@@ -28,7 +28,7 @@ def main():
     if base.is_symlink():
         raise RuntimeError('state_root_symlink')
     os.chown(base, 0, 10020)
-    for name in ('state', 'work', 'library', 'secrets'):
+    for name in ('state', 'work', 'library', 'secrets', 'credentials'):
         p = base / name
         p.mkdir(mode=0o750, exist_ok=True)
         if p.is_symlink():
@@ -37,6 +37,8 @@ def main():
         os.chown(base / name, 10020, 10020)
     os.chown(base / 'secrets', 10020, 10020)
     os.chmod(base / 'secrets', 0o700)
+    os.chown(base / 'credentials', 10020, 10020)
+    os.chmod(base / 'credentials', 0o700)
     image = base / 'work.ext4'
     if not image.exists():
         fd = os.open(image, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

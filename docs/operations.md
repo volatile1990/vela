@@ -36,6 +36,14 @@ systemctl start vela-api.service vela-worker.service
 
 Vor Start prüft `deploy/start_guard.py` Mountquelle, Marker und erforderliche Firewallregeln. Die aktuelle Quelle ist über `/opt/vela/current` erreichbar. Produktive Daten liegen getrennt davon unter `/srv/vela`.
 
+## Sitzungen für Quellen
+
+Unter **Server → Sitzungen für Quellen** können vom Nutzer bereitgestellte Netscape-Cookie-Dateien für Instagram, YouTube, TikTok, Facebook und X hinterlegt werden. Nur die Domains der gewählten Quelle werden übernommen; andere Cookies und Kommentare werden verworfen. Eine Datei ist auf 256 KiB begrenzt. Die [offizielle Exportanleitung](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp) beschreibt das Format.
+
+Dateien liegen mit Modus `0600` unter `/srv/vela/credentials` (Verzeichnis `0700`). Die API erhält diesen Bereich schreibbar, der Worker ausschließlich lesend. Er verwendet pro Auftrag eine eigene private Kopie, die bei Ende, Fehler, Abbruch und Wiederanlauf entfernt wird. Cookie-Inhalte werden nicht in API-Antworten, Jobmetadaten oder Logs ausgegeben. Das Entfernen einer hinterlegten Sitzung wirkt auf neu beginnende Abrufe.
+
+Die Zuordnung erfolgt anhand der Quelladresse, einschließlich passender Kurzlinks. Google-Cookies können zur YouTube-Sitzung gehören; beliebige Google-Seiten werden dadurch nicht als YouTube-Quelle behandelt. Eine hinterlegte Datei bestätigt ihr Format, nicht die Annahme durch die Plattform. Für Anmeldung, Zugriffsverweigerung, Abruflimits, Regions- oder DRM-Beschränkungen gibt es getrennte Fehlerhinweise. Vela nutzt keine externen Downloadportale als Fallback.
+
 ## Build und Auslieferung
 
 Die Runtime verwendet Python 3.13.14, separat gebaute SQLite 3.51.3, yt-dlp 2026.10.26, EJS 0.8.0, Deno 2.9.8 und FFmpeg aus Debian. Python-Abhängigkeiten sind in `requirements.lock`, Browser-Abhängigkeiten in `frontend/package-lock.json` festgeschrieben.

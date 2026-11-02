@@ -434,3 +434,47 @@ svg { display: inline-block; flex-shrink: 0; vertical-align: middle; }
 }
 
 .connection-label { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.source-sessions { margin-top: 23px; }
+.source-sessions > .section-heading { align-items: flex-start; margin-bottom: 21px; }
+.source-sessions h2:focus { outline: none; }
+.source-intro { margin-top: 8px; color: var(--muted); font-size: 13px; line-height: 1.7; }
+.source-picker { display: flex; gap: 8px; flex-wrap: wrap; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
+.source-picker button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 14px; min-height: 41px; background: var(--input); border: 1px solid var(--line); border-radius: 7px; color: var(--muted); font-size: 13px; }
+.source-picker button:hover:not(:disabled) { background: var(--panel-raised); color: var(--text); }
+.source-picker button.selected { border-color: #a77969; color: var(--accent); background: #332d31; }
+.source-status { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; padding: 22px 0 15px; }
+.source-status h3 { font-size: 16px; margin-bottom: 7px; }
+.source-state { font-size: 12px; color: var(--muted); }
+.source-state.good-text { color: var(--green); }
+.warning-text { color: var(--amber) !important; }
+.source-status dl { margin: 0; font-size: 12px; line-height: 1.8; }
+.source-status dl > div { display: flex; justify-content: space-between; gap: 25px; }
+.source-status dt { color: var(--muted); }
+.source-status dd { margin: 0; text-align: right; }
+.source-note { color: var(--muted); font-size: 12px; line-height: 1.8; margin: 0 0 18px; max-width: 680px; }
+.source-upload { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 16px; border: 1px dashed #465367; border-radius: 8px; background: #141e2b; }
+.source-file-label { color: var(--muted); font-size: 12px; line-height: 1.7; }
+.source-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 18px 0 23px; }
+.source-actions .button { min-height: 43px; }
+.source-instructions { padding-top: 18px; border-top: 1px solid var(--line); font-size: 12px; line-height: 1.9; color: var(--muted); }
+.source-instructions summary { color: #d5deeb; cursor: pointer; padding: 4px 0; }
+.source-instructions ol { padding-left: 22px; max-width: 700px; }
+.source-instructions li { margin: 6px 0; padding-left: 3px; }
+.source-instructions p { margin-top: 13px; max-width: 700px; }
+.source-loading { display: flex; align-items: center; gap: 10px; padding: 30px 0; color: var(--muted); font-size: 13px; }
+.session-shortcut { margin: 7px 0 5px; min-height: 32px; }
+@media (max-width: 640px) {
+  .source-sessions { padding: 21px 17px; }
+  .source-picker { gap: 7px; }
+  .source-picker button { padding-inline: 11px; min-height: 44px; font-size: 12px; }
+  .source-intro { font-size: 12px; }
+  .source-status { flex-direction: column; gap: 14px; }
+  .source-status dl { width: 100%; font-size: 11px; }
+  .source-status dl > div { gap: 15px; }
+  .source-upload { padding: 13px; gap: 11px; }
+  .source-upload .button { min-height: 44px; }
+  .source-actions { gap: 7px; }
+  .source-actions .button { padding-inline: 11px; font-size: 12px; min-height: 44px; }
+  .source-instructions { font-size: 12px; }
+  .session-shortcut { font-size: 12px; min-height: 40px; }
+}

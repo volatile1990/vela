@@ -1,6 +1,15 @@
 export type Profile = 'original' | 'compatible' | 'audio';
 export type JobStatus = 'queued' | 'probing' | 'downloading' | 'postprocessing' | 'finalizing' | 'waiting_storage' | 'interrupted' | 'completed' | 'failed' | 'cancelled';
 export interface ServerInfo { version: string }
+export type SourceSite = 'instagram' | 'youtube' | 'tiktok' | 'facebook' | 'x';
+export interface SourceSession {
+  site: SourceSite; label: string; configured: boolean; cookie_count: number;
+  expires_at: string | null; updated_at: string | null; state: 'missing' | 'configured' | 'expired' | 'invalid';
+}
+export const sourceSites: { site: SourceSite; label: string }[] = [
+  { site: 'instagram', label: 'Instagram' }, { site: 'youtube', label: 'YouTube' }, { site: 'tiktok', label: 'TikTok' },
+  { site: 'facebook', label: 'Facebook' }, { site: 'x', label: 'X' },
+];
 export interface Artifact { id: string; job_id: string; name: string; size: number; mime: string; relative_path: string }
 export interface MetadataEntry { title?: string; id?: string; duration?: number; url?: string }
 export interface Job {
@@ -24,31 +33,35 @@ export class ApiError extends Error {
   constructor(message: string, public status: number) { super(message); }
 }
 
-function errorMessage(body: unknown, status: number): string {
+function errorMessage(body: unknown, status: number, sourceFile = false): string {
   if (status === 401) return 'Die Anfrage ist nicht erlaubt. Bitte lade die Seite neu.';
   if (status === 429) return 'Zu viele Versuche. Bitte warte einen Moment und versuche es erneut.';
-  if (status === 422) return 'Bitte prüfe den Link und die gewählten Optionen.';
+  if (status === 422) {
+    if (sourceFile) return body && typeof body === 'object' && 'detail' in body && typeof body.detail === 'string' ? body.detail : 'Die Datei enthält keine gültige Sitzung für diese Quelle. Verwende das Netscape-Format.';
+    return 'Bitte prüfe den Link und die gewählten Optionen.';
+  }
+  if (status === 413) return 'Die Datei ist zu groß. Wähle eine cookies.txt mit höchstens 256 KB.';
   if (status === 403) return 'Die Aktion konnte nicht bestätigt werden. Bitte lade die Seite neu.';
   if (body && typeof body === 'object' && 'detail' in body && typeof body.detail === 'string') return body.detail;
   return 'Die Anfrage konnte nicht abgeschlossen werden. Bitte versuche es erneut.';
 }
 
 export class Api {
-  async request<T>(path: string, body?: unknown, extraHeaders?: Record<string, string>): Promise<T> {
+  async request<T>(path: string, body?: unknown, extraHeaders?: Record<string, string>, method?: 'PUT' | 'DELETE', rawText = false): Promise<T> {
     let response: Response;
     try {
       response = await fetch(`/api${path}`, {
-        method: body === undefined ? 'GET' : 'POST', credentials: 'same-origin', cache: 'no-store',
+        method: method ?? (body === undefined ? 'GET' : 'POST'), credentials: 'same-origin', cache: 'no-store',
         headers: {
           Accept: 'application/json',
-          ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+          ...(body !== undefined ? { 'Content-Type': rawText ? 'text/plain;charset=UTF-8' : 'application/json' } : {}),
           ...extraHeaders,
         },
-        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        ...(body !== undefined ? { body: rawText ? String(body) : JSON.stringify(body) } : {}),
       });
     } catch { throw new ApiError('Vela ist gerade nicht erreichbar. Prüfe deine Verbindung und versuche es erneut.', 0); }
     const result: unknown = await response.json().catch(() => null);
-    if (!response.ok) throw new ApiError(errorMessage(result, response.status), response.status);
+    if (!response.ok) throw new ApiError(errorMessage(result, response.status, rawText), response.status);
     return result as T;
   }
 
@@ -60,6 +73,22 @@ export class Api {
   preview = (options: DownloadOptions) => this.request<Job>('/previews', options);
   cancel = (id: string) => this.request<Job>(`/jobs/${encodeURIComponent(id)}/cancel`, {});
   retry = (id: string) => this.request<Job>(`/jobs/${encodeURIComponent(id)}/retry`, {});
+  sourceSessions = () => this.request<{ items: SourceSession[] }>('/source-sessions');
+  saveSourceSession = (site: SourceSite, content: string) => this.request<SourceSession>(`/source-sessions/${site}`, content, undefined, 'PUT', true);
+  removeSourceSession = (site: SourceSite) => this.request<{ ok: boolean }>(`/source-sessions/${site}`, undefined, undefined, 'DELETE');
+}
+
+export function sourceSiteForUrl(value: string): SourceSite | null {
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    const matches = (domain: string) => host === domain || host.endsWith(`.${domain}`);
+    if (matches('instagram.com')) return 'instagram';
+    if (matches('youtube.com') || matches('youtu.be')) return 'youtube';
+    if (matches('tiktok.com')) return 'tiktok';
+    if (matches('facebook.com') || matches('fb.watch')) return 'facebook';
+    if (matches('x.com') || matches('twitter.com')) return 'x';
+    return null;
+  } catch { return null; }
 }
 
 export const terminal = (status: JobStatus) => ['completed', 'failed', 'cancelled'].includes(status);

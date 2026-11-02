@@ -204,3 +204,50 @@ def test_full_queue_keeps_existing_playlist_children_without_duplicates(setup):
         asyncio.run(worker._expand_playlist(job, info, asyncio.Event()))
     assert error.value.category == "queue_full"
     assert db.count_jobs() == 2
+
+
+@pytest.mark.parametrize("status", ["queued", "downloading", "finalizing", "waiting_storage"])
+def test_crash_recovery_removes_cookie_copy_after_process_reconciliation(setup, monkeypatch, status):
+    settings, db, engine = setup
+    job = db.create_job(url="https://example.com/video")
+    metadata = {"finalization": [{"source": "media.mp4", "title": "Video"}]} if status in ("finalizing", "waiting_storage") else {}
+    db.update_job(job["id"], status=status, metadata=metadata)
+    directory = settings.work_dir / job["id"]
+    directory.mkdir()
+    cookie = directory / ".vela-cookies.txt"
+    cookie.write_text("synthetic-crash-session")
+    part = directory / "media.mp4.part"
+    part.write_bytes(b"partial media stays")
+    observed = []
+
+    def reconcile(path):
+        assert path == directory
+        assert cookie.exists()  # Never remove session material from a live child.
+        observed.append(path)
+
+    monkeypatch.setattr("vela.worker.recover_process", reconcile)
+    with WorkerLock(settings.state_dir):
+        Worker(settings, db=db, engine=engine).recover()
+    assert observed == [directory]
+    assert not cookie.exists()
+    assert part.read_bytes() == b"partial media stays"
+    expected = "waiting_storage" if status in ("finalizing", "waiting_storage") else "queued"
+    assert db.get_job(job["id"])["status"] == expected
+
+
+def test_crash_cookie_is_retained_if_old_process_cannot_be_safely_reconciled(setup, monkeypatch):
+    settings, db, engine = setup
+    job = db.create_job(url="https://example.com/video")
+    db.update_job(job["id"], status="downloading")
+    directory = settings.work_dir / job["id"]
+    directory.mkdir()
+    cookie = directory / ".vela-cookies.txt"
+    cookie.write_text("synthetic-crash-session")
+
+    def unsafe(_):
+        raise EngineError("Vorheriger Prozess ist noch aktiv.", "recovery")
+
+    monkeypatch.setattr("vela.worker.recover_process", unsafe)
+    with WorkerLock(settings.state_dir), pytest.raises(EngineError):
+        Worker(settings, db=db, engine=engine).recover()
+    assert cookie.read_text() == "synthetic-crash-session"

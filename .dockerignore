@@ -8,3 +8,7 @@ frontend/dist
 output
 *.dpapi
 *.env
+credentials
+**/cookies.txt
+**/*.cookies.txt
+**/*.cookies

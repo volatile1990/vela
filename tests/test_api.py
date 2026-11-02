@@ -15,7 +15,7 @@ def setup(tmp_path, monkeypatch):
     downloads = tmp_path / "downloads"
     downloads.mkdir()
     (downloads / ".vela-volume").write_text("test-volume")
-    settings = Settings(state_dir=tmp_path / "state", work_dir=tmp_path / "work", download_dir=downloads, base_url="http://testserver", storage_marker="test-volume", frontend_dir=tmp_path / "frontend")
+    settings = Settings(state_dir=tmp_path / "state", work_dir=tmp_path / "work", download_dir=downloads, credentials_dir=tmp_path / "credentials", base_url="http://testserver", storage_marker="test-volume", frontend_dir=tmp_path / "frontend")
     app = create_app(settings)
     with TestClient(app) as client:
         yield client, app, settings

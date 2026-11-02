@@ -16,3 +16,7 @@ output/
 !deploy/runtime.env.example
 *.pem
 *.key
+credentials/
+**/cookies.txt
+**/*.cookies.txt
+**/*.cookies

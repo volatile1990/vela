@@ -87,4 +87,6 @@ Vela läuft unter **https://vela.home.arpa** am vorhandenen Caddy und ist in NEX
 
 Die lokale Prüfung verwendet `python -m pytest` sowie im Frontend `npm test` und `npm run build`; Voraussetzungen stehen im [README](../README.md). Tests decken unter anderem Host-/Origin-Prüfung, direkten Zugang ohne Anmeldung, Queue, Abbruch, Wiederanlauf, Speicherprüfung und Browser-Arbeitsabläufe ab. Plattformtests mit realen Quellen bleiben zusätzlich erforderlich.
 
-Noch nicht enthalten sind Kanalabonnements, Cookies-/PO-Token-Verwaltung, Untertitel-/Thumbnailprofile, Medienlöschung, automatische Medienbackups und Browser-/Teilen-Integrationen. Diese Punkte sind spätere Erweiterungen. PostgreSQL oder ein Broker werden erst bei mehreren Workerhosts beziehungsweise nachgewiesener hoher Schreibkonkurrenz neu bewertet.
+Für Quellen mit Anmeldung gibt es eine optionale Sitzungsverwaltung für vom Nutzer bereitgestellte Cookie-Dateien. Sie ist nach Quelle und erlaubten Cookie-Domains getrennt; Aufträge verwenden private temporäre Kopien. Vela selbst bleibt ohne Anmeldung im Trusted-Netz. Fremde Downloadportale werden nicht automatisch genutzt.
+
+Noch nicht enthalten sind Kanalabonnements, PO-Token-Verwaltung, Untertitel-/Thumbnailprofile, Medienlöschung, automatische Medienbackups und Browser-/Teilen-Integrationen. Diese Punkte sind spätere Erweiterungen. PostgreSQL oder ein Broker werden erst bei mehreren Workerhosts beziehungsweise nachgewiesener hoher Schreibkonkurrenz neu bewertet.

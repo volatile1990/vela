@@ -14,6 +14,9 @@ import subprocess
 import ipaddress
 import socket
 import time
+import re
+import stat
+from contextlib import contextmanager
 from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -22,6 +25,22 @@ from typing import Any, Awaitable, Callable
 EventCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
 METADATA_TEMPLATE = "%(.{id,title,duration,extractor_key,uploader})j"
 PROGRESS_TEMPLATE = "%(progress.{status,downloaded_bytes,total_bytes,total_bytes_estimate,speed,eta,fragment_index,fragment_count})j"
+ERROR_MESSAGES = {
+    "audience_restricted": "Instagram gibt dieses Video für den aktuellen Abruf nicht frei. Eine gültige Sitzung oder eine Alters- bzw. Regionsfreigabe kann erforderlich sein.",
+    "login_required": "Die Quelle verlangt eine gültige Sitzung oder eine entsprechende Kontofreigabe. Bitte die Sitzung hinterlegen oder erneuern.",
+    "rate_limited": "Die Quelle begrenzt derzeit die Abrufe. Bitte später erneut versuchen.",
+    "access_denied": "Die Quelle hat den Zugriff vom Heimserver abgelehnt.",
+    "not_found": "Das Medium wurde unter dieser Adresse nicht gefunden oder ist nicht mehr verfügbar.",
+    "unavailable": "Die Quelle meldet das Medium als nicht verfügbar.",
+    "no_media": "Dieser Beitrag enthält kein herunterladbares Video.",
+    "extractor": "Die Quelle hat keine auswertbaren Mediendaten geliefert. Bitte später erneut versuchen.",
+    "format": "Für dieses Profil ist kein passendes Format verfügbar.",
+    "network": "Die Quelle konnte nicht erreicht werden.",
+    "storage": "Die Arbeitsdatei konnte nicht gespeichert werden.",
+    "unsupported_url": "Diese Adresse wird von der Download-Engine derzeit nicht unterstützt.",
+    "drm_protected": "Das Video ist durch DRM geschützt und kann mit Vela nicht heruntergeladen werden.",
+    "geo_restricted": "Die Quelle gibt dieses Video in der Region des Heimservers nicht frei.",
+}
 
 
 class EngineError(RuntimeError):
@@ -161,7 +180,7 @@ class Engine:
     def __init__(self, executable: str = "yt-dlp", *, timeout: float = 7200,
                  probe_timeout: float = 90, max_output: int = 64 * 1024 * 1024,
                  max_line: int = 1024 * 1024, cancel_grace: float = 4,
-                 ffprobe_executable: str = "ffprobe"):
+                 ffprobe_executable: str = "ffprobe", credentials_dir: Path | str | None = None):
         self.executable = executable
         self.timeout = timeout
         self.probe_timeout = probe_timeout
@@ -169,11 +188,79 @@ class Engine:
         self.max_line = max_line
         self.cancel_grace = cancel_grace
         self.ffprobe_executable = ffprobe_executable
+        self.credentials_dir = Path(credentials_dir) if credentials_dir is not None else None
 
     def common_args(self) -> list[str]:
         return [self.executable, "--ignore-config", "--no-cache-dir", "--no-colors",
                 "--no-warnings", "--socket-timeout", "20", "--retries", "3",
                 "--fragment-retries", "3", "--extractor-retries", "2"]
+
+    @contextmanager
+    def _session_args(self, url: str, work_dir: Path):
+        """Use only a fixed site's validated private copy; never mutate its jar."""
+        validate_source_url(url)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        copy = work_dir / ".vela-cookies.txt"
+        try:
+            # This also removes a remnant from an interrupted previous attempt.
+            copy.unlink(missing_ok=True)
+            args: list[str] = []
+            if self.credentials_dir is not None:
+                from .source_sessions import site_for_url, validate_cookie_text, SourceSessionError
+                site = site_for_url(url)
+                if site is not None:
+                    source = self.credentials_dir / f"{site}.cookies.txt"
+                    try:
+                        if self.credentials_dir.is_symlink():
+                            raise OSError("Not a regular session directory")
+                        source_info = source.lstat()
+                        if not stat.S_ISREG(source_info.st_mode) or source_info.st_nlink != 1 or (os.name == "posix" and source_info.st_mode & 0o077):
+                            raise OSError("Not a private regular session file")
+                        descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+                    except FileNotFoundError:
+                        descriptor = None  # Missing session explicitly means anonymous.
+                    except OSError:
+                        raise EngineError("Die bereitgestellte Sitzung konnte nicht sicher gelesen werden.", "session_invalid") from None
+                    if descriptor is not None:
+                        try:
+                            with os.fdopen(descriptor, "rb") as incoming:
+                                actual = os.fstat(incoming.fileno())
+                                if not stat.S_ISREG(actual.st_mode) or actual.st_nlink != 1 or (actual.st_dev, actual.st_ino) != (source_info.st_dev, source_info.st_ino):
+                                    raise ValueError("Not a regular session file")
+                                content = incoming.read(256 * 1024 + 1)
+                            if len(content) > 256 * 1024:
+                                raise ValueError("Session file too large")
+                            validated = validate_cookie_text(site, content.decode("utf-8-sig"))
+                            descriptor = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as outgoing:
+                                outgoing.write(validated.text)
+                                outgoing.flush()
+                            os.chmod(copy, 0o600)
+                            args = ["--cookies", str(copy)]
+                        except (OSError, UnicodeError, ValueError, SourceSessionError):
+                            raise EngineError("Die bereitgestellte Sitzung ist ungültig, abgelaufen oder passt nicht zur Quelle.", "session_invalid") from None
+            yield args
+        finally:
+            try:
+                copy.unlink(missing_ok=True)
+            except OSError:
+                raise EngineError("Die temporäre Sitzung konnte nicht bereinigt werden.", "session_cleanup") from None
+
+    async def _run_source(self, args: list[str], url: str, work_dir: Path,
+                          receive: Callable[[str], Awaitable[None]], cancel: asyncio.Event | None,
+                          timeout: float, on_session: Callable[[dict[str, Any]], Awaitable[None]] | None = None) -> dict[str, Any]:
+        with self._session_args(url, work_dir) as session_args:
+            site = None
+            if session_args:
+                from .source_sessions import site_for_url
+                site = site_for_url(url)
+            session = {"source_session_used": bool(session_args), "source_session_site": site}
+            if on_session:
+                await on_session(session)
+            separator = args.index("--")
+            command = args[:separator] + session_args + args[separator:]
+            await self._run(command, work_dir, receive, cancel, timeout)
+            return session
 
     async def validate_dns(self, url: str) -> None:
         validate_source_url(url)
@@ -201,7 +288,7 @@ class Engine:
             if line.strip():
                 lines.append(line)
 
-        await self._run(args, work_dir, receive, cancel, self.probe_timeout)
+        session = await self._run_source(args, url, work_dir, receive, cancel, self.probe_timeout)
         try:
             info = json.loads("\n".join(lines))
         except (ValueError, TypeError) as exc:
@@ -209,6 +296,7 @@ class Engine:
         if not isinstance(info, dict):
             raise EngineError("Ungültige Metadaten der Quelle.", "metadata")
         result = public_metadata(info)
+        result.update(session)
         entries = info.get("entries")
         if isinstance(entries, list):
             result["entries"] = [
@@ -243,6 +331,12 @@ class Engine:
         args += ["--", url]
         result = DownloadResult()
         root = work_dir.resolve()
+        session: dict[str, Any] = {}
+
+        async def session_selected(info: dict[str, Any]) -> None:
+            session.update(info)
+            if on_event:
+                await on_event("source_session", info)
 
         async def receive(line: str) -> None:
             kind, sep, payload = line.partition(":")
@@ -254,6 +348,7 @@ class Engine:
                 raise EngineError("Ungültige Antwort der Download-Engine.", "protocol") from exc
             if kind == "VELA_META" and isinstance(value, dict):
                 result.metadata = public_metadata(value)
+                result.metadata.update(session)
                 if on_event:
                     await on_event("metadata", result.metadata)
             elif kind == "VELA_FILE" and isinstance(value, str):
@@ -268,7 +363,7 @@ class Engine:
             elif kind == "VELA_POSTPROCESS" and on_event:
                 await on_event("postprocessing", {})
 
-        await self._run(args, work_dir, receive, cancel, self.timeout)
+        await self._run_source(args, url, work_dir, receive, cancel, self.timeout, session_selected)
         if not result.files:
             raise EngineError("Der Download lieferte keine fertige Datei.", "missing_file")
         if profile == "compatible":
@@ -333,7 +428,7 @@ class Engine:
                 text = raw.decode("utf-8", errors="replace").strip()
                 if stdout:
                     await receive(text)
-                elif "ERROR:" in text:
+                elif "error:" in text.casefold():
                     # Store categories only. Remote URLs may contain secrets.
                     errors.append(self._error_category(text))
 
@@ -358,13 +453,8 @@ class Engine:
                 if cancel and cancel.is_set():
                     raise EngineCancelled()
                 if proc.returncode:
-                    category = errors[-1] if errors else "download"
-                    messages = {"format": "Für dieses Profil ist kein passendes Format verfügbar.",
-                        "authentication": "Die Quelle erfordert eine Anmeldung oder zusätzliche Freigabe.",
-                        "unavailable": "Das Medium ist nicht verfügbar.",
-                        "network": "Die Quelle konnte nicht erreicht werden.",
-                        "storage": "Die Arbeitsdatei konnte nicht gespeichert werden."}
-                    raise EngineError(messages.get(category, "Die Quelle konnte nicht heruntergeladen werden."), category)
+                    category = next((value for value in reversed(errors) if value != "download"), "download")
+                    raise EngineError(ERROR_MESSAGES.get(category, "Die Quelle konnte nicht heruntergeladen werden."), category)
         except TimeoutError as exc:
             raise EngineError("Zeitlimit der Download-Engine erreicht.", "timeout") from exc
         finally:
@@ -409,15 +499,35 @@ class Engine:
 
     @staticmethod
     def _error_category(message: str) -> str:
-        text = message.lower()
+        # Match known diagnostic phrases, never return remote text or URLs.
+        # A 403 alone does not prove that authentication would fix the request.
+        text = message.casefold().replace("’", "'")
+        if "unsupported url" in text or "no suitable extractor" in text:
+            return "unsupported_url"
+        if re.search(r"\bdrm\b", text):
+            return "drm_protected"
+        if any(phrase in text for phrase in ("not available in your country", "not available from your location", "not available in your region", "geo-restricted", "geographically restricted", "blocked in your country")):
+            return "geo_restricted"
+        if any(phrase in text for phrase in ("this content isn't available to everyone", "can't be seen by certain audiences", "cannot be seen by certain audiences")):
+            return "audience_restricted"
+        if any(phrase in text for phrase in ("too many requests", "rate-limit", "rate limit", "please wait a few minutes")) or re.search(r"\b(?:http(?:\s+error|\s+status)?|status(?:\s+code)?)\s*:?\s*429\b", text):
+            return "rate_limited"
+        if any(phrase in text for phrase in ("login required", "login is required", "without login", "log in", "sign in", "sign-in", "login page", "registered users", "follow this account", "private video", "private account", "restricted video", "not a bot", "authentication is required", "cookies have expired", "cookies are no longer valid")):
+            return "login_required"
+        if any(phrase in text for phrase in ("there is no video in this post", "no video in this post", "does not contain a video")):
+            return "no_media"
         if "requested format" in text or "no video formats" in text:
             return "format"
-        if any(word in text for word in ("sign in", "login", "cookies", "not a bot", "403", "private video")):
-            return "authentication"
-        if any(word in text for word in ("not available", "unavailable", "404", "removed")):
-            return "unavailable"
+        if re.search(r"\b(?:http(?:\s+error|\s+status)?|status(?:\s+code)?)\s*:?\s*(?:404|410)\b", text) or any(phrase in text for phrase in ("not found", "does not exist", "has been removed", "was removed")):
+            return "not_found"
         if any(word in text for word in ("no space", "permission denied", "read-only file")):
             return "storage"
-        if any(word in text for word in ("timed out", "network", "connection", "resolve")):
+        if any(word in text for word in ("timed out", "network", "connection", "resolve", "name resolution", "certificate verify failed", "temporary failure in name")) or re.search(r"\b(?:http(?:\s+error|\s+status)?|status(?:\s+code)?)\s*:?\s*5\d\d\b", text):
             return "network"
+        if re.search(r"\b(?:http(?:\s+error|\s+status)?|status(?:\s+code)?)\s*:?\s*403\b", text) or "forbidden" in text:
+            return "access_denied"
+        if any(phrase in text for phrase in ("empty media response", "unable to extract", "failed to extract", "invalid json", "json decode")):
+            return "extractor"
+        if any(phrase in text for phrase in ("not available", "unavailable", "content is unreachable")):
+            return "unavailable"
         return "download"

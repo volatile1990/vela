@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { Api, ApiError, active, formatBytes, formatDuration, hostLabel, statusLabels, terminal, validMediaUrl } from './api';
-import type { DownloadOptions, Job, Overview, Profile, ServerInfo, Storage } from './api';
+import { Api, ApiError, active, formatBytes, formatDuration, hostLabel, statusLabels, terminal, validMediaUrl, sourceSiteForUrl } from './api';
+import type { DownloadOptions, Job, Overview, Profile, ServerInfo, SourceSite, Storage } from './api';
 import { Icon, VelaMark } from './icons';
+import SourceSessions from './SourceSessions';
 
 type View = 'downloads' | 'history' | 'server';
 type HistoryFilter = 'all' | 'completed' | 'failed' | 'cancelled';
@@ -32,6 +33,9 @@ export default function App() {
 function Dashboard({ version }: { version: string }) {
   const api = useMemo(() => new Api(), []);
   const [view, setView] = useState<View>('downloads');
+  const [sourceSite, setSourceSite] = useState<SourceSite>('instagram');
+  const [focusSourceSessions, setFocusSourceSessions] = useState(false);
+  function openSourceSession(site: SourceSite) { setSourceSite(site); setFocusSourceSessions(true); setView('server'); }
   const [jobs, setJobs] = useState<Job[]>([]);
   const [total, setTotal] = useState(0);
   const [overview, setOverview] = useState<Overview | null>(null);
@@ -128,28 +132,28 @@ function Dashboard({ version }: { version: string }) {
         <div className="sr-only" role="status" aria-live="polite">{notice}</div>
         {view === 'downloads' && <>
           <div className="page-heading"><div><div className="eyebrow">DOWNLOADS</div><h1>Was möchtest du speichern?</h1><p>Ein Link zu deinem nächsten Video oder Audio genügt.</p></div><span className="quiet-tag"><Icon name="folder" size={15} /> Auf deinem Server</span></div>
-          <div className="download-layout"><div className="download-primary"><DownloadComposer api={api} onCreated={onCreated} onError={handleError} />
+          <div className="download-layout"><div className="download-primary"><DownloadComposer api={api} onCreated={onCreated} onError={handleError} onSourceSession={openSourceSession} />
             <section className="queue-section" aria-labelledby="queue-heading"><div className="section-heading"><h2 id="queue-heading">Warteschlange <span className="count-badge">{running.length}</span></h2><span className="subtle">{running.length ? 'Vela arbeitet für dich' : 'Bereit für deinen nächsten Link'}</span></div>
-              {initialLoading ? <ListSkeleton /> : running.length ? <div className="job-list">{running.map(job => <JobRow key={job.id} job={job} pending={pendingJobs.has(job.id)} onAction={action} />)}</div> : <div className="empty-state"><span className="empty-icon"><Icon name="queue" size={25} /></span><div><h3>Alles ist erledigt.</h3><p>Neue Downloads erscheinen hier. Du kannst Vela danach geöffnet lassen oder später wiederkommen.</p></div></div>}
+              {initialLoading ? <ListSkeleton /> : running.length ? <div className="job-list">{running.map(job => <JobRow key={job.id} job={job} pending={pendingJobs.has(job.id)} onAction={action} onSourceSession={openSourceSession} />)}</div> : <div className="empty-state"><span className="empty-icon"><Icon name="queue" size={25} /></span><div><h3>Alles ist erledigt.</h3><p>Neue Downloads erscheinen hier. Du kannst Vela danach geöffnet lassen oder später wiederkommen.</p></div></div>}
             </section>
-            {history.length > 0 && <section className="recent-section" aria-labelledby="recent-heading"><div className="section-heading"><h2 id="recent-heading">Letzte Aufträge</h2><button className="text-button" onClick={() => setView('history')}>Zum Verlauf <Icon name="arrow" size={15} /></button></div><div className="job-list">{history.slice(0, 3).map(job => <JobRow key={job.id} job={job} pending={pendingJobs.has(job.id)} onAction={action} compact />)}</div></section>}
+            {history.length > 0 && <section className="recent-section" aria-labelledby="recent-heading"><div className="section-heading"><h2 id="recent-heading">Letzte Aufträge</h2><button className="text-button" onClick={() => setView('history')}>Zum Verlauf <Icon name="arrow" size={15} /></button></div><div className="job-list">{history.slice(0, 3).map(job => <JobRow key={job.id} job={job} pending={pendingJobs.has(job.id)} onAction={action} onSourceSession={openSourceSession} compact />)}</div></section>}
           </div><aside className="context-column"><StorageCard storage={storage} /><div className="server-note"><div className="section-heading"><span className="mini-title">DEIN SERVER</span><Icon name="server" size={17} /></div><p><span className={`status-dot ${workerReady ? 'good' : 'warning'}`} />{workerReady ? 'Bereit für Downloads' : 'Wartet auf Verbindung'}</p><span>Downloads laufen auf deinem Server weiter, auch wenn du den Browser schließt.</span><button className="text-button" onClick={() => setView('server')}>Serverstatus ansehen <Icon name="arrow" size={15} /></button></div></aside></div>
         </>}
         {view === 'history' && <>
           <div className="page-heading"><div><div className="eyebrow">VERLAUF</div><h1>Deine Downloads.</h1><p>Gespeicherte Dateien und vergangene Aufträge an einem Ort.</p></div></div>
           <section className="history-panel"><div className="history-toolbar"><div className="filter-group" role="group" aria-label="Verlauf filtern">{(['all', 'completed', 'failed', 'cancelled'] as HistoryFilter[]).map(filter => <button key={filter} className={historyFilter === filter ? 'selected' : ''} aria-pressed={historyFilter === filter} onClick={() => setHistoryFilter(filter)}>{({ all: 'Alle', completed: 'Abgeschlossen', failed: 'Fehler', cancelled: 'Abgebrochen' })[filter]}</button>)}</div><input type="search" className="history-search" aria-label="Verlauf durchsuchen" placeholder="Titel oder Quelle suchen" value={search} onChange={event => setSearch(event.target.value)} /></div>
-          {initialLoading ? <ListSkeleton /> : visibleHistory.length ? <div className="job-list">{visibleHistory.map(job => <JobRow key={job.id} job={job} pending={pendingJobs.has(job.id)} onAction={action} />)}</div> : <div className="empty-state spacious"><span className="empty-icon"><Icon name="history" size={27} /></span><div><h3>{search || historyFilter !== 'all' ? 'Keine passenden Downloads.' : 'Dein Verlauf beginnt hier.'}</h3><p>{search || historyFilter !== 'all' ? 'Versuche einen anderen Suchbegriff oder Filter.' : 'Sobald dein erster Download fertig ist, findest du ihn hier.'}</p></div></div>}
+          {initialLoading ? <ListSkeleton /> : visibleHistory.length ? <div className="job-list">{visibleHistory.map(job => <JobRow key={job.id} job={job} pending={pendingJobs.has(job.id)} onAction={action} onSourceSession={openSourceSession} />)}</div> : <div className="empty-state spacious"><span className="empty-icon"><Icon name="history" size={27} /></span><div><h3>{search || historyFilter !== 'all' ? 'Keine passenden Downloads.' : 'Dein Verlauf beginnt hier.'}</h3><p>{search || historyFilter !== 'all' ? 'Versuche einen anderen Suchbegriff oder Filter.' : 'Sobald dein erster Download fertig ist, findest du ihn hier.'}</p></div></div>}
           {jobs.length < total && <button className="button secondary load-more" onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore && <Spinner />}Ältere Aufträge laden</button>}
           </section>
         </>}
-        {view === 'server' && <ServerView overview={overview} connected={connected} workerReady={workerReady} loading={initialLoading} onRefresh={() => void refresh()} />}
+        {view === 'server' && <ServerView api={api} sourceSite={sourceSite} focusSourceSessions={focusSourceSessions} overview={overview} connected={connected} workerReady={workerReady} loading={initialLoading} onRefresh={() => void refresh()} />}
         <footer className="content-footer"><span>Deine Medien bleiben bei dir.</span><span>Vela {overview?.version ?? version}</span></footer>
       </main>
     </div>
   </div>;
 }
 
-function DownloadComposer({ api, onCreated, onError }: { api: Api; onCreated: (job: Job) => void; onError: (error: unknown) => void }) {
+function DownloadComposer({ api, onCreated, onError, onSourceSession }: { api: Api; onCreated: (job: Job) => void; onError: (error: unknown) => void; onSourceSession: (site: SourceSite) => void }) {
   const [url, setUrl] = useState(() => new URLSearchParams(window.location.search).get('url') ?? '');
   const [profile, setProfile] = useState<Profile>('original');
   const [maxHeight, setMaxHeight] = useState(1080);
@@ -218,7 +222,7 @@ function DownloadComposer({ api, onCreated, onError }: { api: Api; onCreated: (j
       {profile === 'compatible' && <p className="profile-hint">Lädt H.264 und AAC als MP4. Ist keine passende Quelle verfügbar, meldet Vela einen Fehler.</p>}
       {previewPending && <div className="preview-loading" role="status"><Spinner /><div><strong>Vorschau wird geladen</strong><span>Vela prüft den Link auf deinem Server.</span></div></div>}
       {preview?.status === 'completed' && <PreviewCard job={preview} />}
-      {preview?.status === 'failed' && <ErrorNotice>{preview.error ?? 'Diese Vorschau konnte nicht geladen werden. Prüfe den Link oder versuche es erneut.'}</ErrorNotice>}
+      {preview?.status === 'failed' && <><ErrorNotice>{preview.error ?? 'Diese Vorschau konnte nicht geladen werden. Prüfe den Link oder versuche es erneut.'}</ErrorNotice>{sessionSite(preview) && <button className="text-button session-shortcut" type="button" onClick={() => onSourceSession(sessionSite(preview)!)}>Sitzung hinterlegen <Icon name="arrow" size={15} /></button>}</>}
       {error && <ErrorNotice>{error}</ErrorNotice>}
       {success && <div className="notice success" role="status"><Icon name="check" size={19} /><span>{success}</span></div>}
       <div className="composer-footer"><button type="button" className="button ghost" onClick={() => void loadPreview()} disabled={!url.trim() || previewPending || submitting}>{previewPending ? <Spinner /> : <Icon name="eye" size={18} />}Vorschau</button><button className="button primary" type="submit" disabled={!url.trim() || submitting}>{submitting ? <Spinner /> : <Icon name="download" size={18} />}{submitting ? 'Wird hinzugefügt …' : 'Download starten'}</button></div>
@@ -231,7 +235,7 @@ function PreviewCard({ job }: { job: Job }) {
   return <div className="preview-card"><div className="preview-art"><Icon name={entries.length ? 'queue' : 'video'} size={28} /></div><div className="preview-info"><span className="mini-title">VORSCHAU</span><h3>{job.metadata?.title || job.title || 'Medien erkannt'}</h3><p>{hostLabel(job.url)}{typeof job.metadata?.duration === 'number' && <> <span>·</span> {formatDuration(job.metadata.duration)}</>}{entries.length > 0 && <> <span>·</span> {entries.length} Einträge erkannt</>}</p>{entries.length > 0 && <details className="preview-entries"><summary>Einträge ansehen</summary><ol>{entries.slice(0, 10).map((entry, index) => <li key={`${entry.id ?? index}-${index}`}>{entry.title || `Eintrag ${index + 1}`}</li>)}</ol>{entries.length > 10 && <p>und {entries.length - 10} weitere</p>}</details>}</div><span className="preview-check"><Icon name="check" size={18} /></span></div>;
 }
 
-function JobRow({ job, pending, onAction, compact = false }: { job: Job; pending: boolean; onAction: (job: Job, action: 'cancel' | 'retry') => Promise<void>; compact?: boolean }) {
+function JobRow({ job, pending, onAction, onSourceSession, compact = false }: { job: Job; pending: boolean; onAction: (job: Job, action: 'cancel' | 'retry') => Promise<void>; onSourceSession: (site: SourceSite) => void; compact?: boolean }) {
   const isActive = active(job.status);
   const progress = job.progress == null ? null : Math.min(100, Math.max(0, job.progress));
   const [showDetails, setShowDetails] = useState(false);
@@ -245,6 +249,7 @@ function JobRow({ job, pending, onAction, compact = false }: { job: Job; pending
       {isActive && job.status !== 'queued' && <div className="job-progress-area"><div className={`progress-track ${progress == null ? 'indeterminate' : ''}`} role="progressbar" aria-label={`Fortschritt für ${job.title || 'Download'}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress ?? undefined} aria-valuetext={progress == null ? statusText : `${Math.round(progress)} Prozent, ${statusText}`}><div style={{ width: progress == null ? '32%' : `${progress}%` }} /></div><div className="progress-details"><span>{progress != null ? `${Math.round(progress)} %` : statusText}{job.downloaded_bytes != null && <> <span className="meta-divider">·</span> {formatBytes(job.downloaded_bytes)}{job.total_bytes ? ` / ${formatBytes(job.total_bytes)}` : ''}</>}</span><span>{job.speed ? `${formatBytes(job.speed)}/s` : ''}{job.eta != null && job.eta > 0 ? ` · noch ${formatDuration(job.eta)}` : ''}</span></div></div>}
       {job.status === 'waiting_storage' && <p className="job-help">Der Zielspeicher ist gerade nicht verfügbar. Vela versucht es erneut.</p>}
       {job.error && <div className="job-error"><Icon name="alert" size={14} /><span>{job.error}</span></div>}
+      {sessionSite(job) && <button className="text-button session-shortcut" onClick={() => onSourceSession(sessionSite(job)!)}>Sitzung hinterlegen <Icon name="arrow" size={14} /></button>}
       {files.length > 1 && <button className="text-button files-toggle" aria-expanded={showDetails} onClick={() => setShowDetails(!showDetails)}>{files.length} Dateien · {formatBytes(files.reduce((sum, file) => sum + file.size, 0))}<Icon name="chevron" size={13} style={{ transform: showDetails ? 'rotate(90deg)' : undefined }} /></button>}
       {files.length === 1 && !isActive && <div className="file-meta">{formatBytes(files[0].size)}<span className="meta-divider">·</span>{files[0].name.split('.').pop()?.toUpperCase()}</div>}
       {showDetails && <ul className="artifact-list">{files.map(file => <li key={file.id}><a href={`/api/artifacts/${encodeURIComponent(file.id)}/download`} download><Icon name="download" size={15} /><span>{file.name}</span><small>{formatBytes(file.size)}</small></a></li>)}</ul>}
@@ -262,11 +267,13 @@ function StorageCard({ storage }: { storage: Storage | undefined }) {
   return <section className="storage-card" aria-labelledby="storage-heading"><div className="section-heading"><span className="mini-title" id="storage-heading">SPEICHER</span><span className={`storage-status ${storage?.available ? 'good-text' : ''}`}><span className={`status-dot ${storage?.available ? 'good' : 'warning'}`} />{storage?.available ? 'Verbunden' : storage ? 'Nicht verfügbar' : 'Wird geprüft'}</span></div><div className="storage-icon"><Icon name="folder" size={24} /></div><h3>{storage?.label || 'Medienarchiv'}</h3><div className="storage-free">{formatBytes(storage?.free_bytes)}<span> frei</span></div>{usedRatio !== null && <div className="storage-track" role="meter" aria-label="Speicherbelegung" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(usedRatio)}><span style={{ width: `${usedRatio}%` }} /></div>}<p>{storage?.total_bytes ? `von ${formatBytes(storage.total_bytes)} Gesamtspeicher` : 'Speicherinformationen werden vom Server geladen.'}</p>{storage?.error && <p className="storage-error">Der Speicher ist vorübergehend nicht erreichbar.</p>}</section>;
 }
 
-function ServerView({ overview, connected, workerReady, loading, onRefresh }: { overview: Overview | null; connected: boolean; workerReady: boolean; loading: boolean; onRefresh: () => void }) {
+function ServerView({ api, sourceSite, focusSourceSessions, overview, connected, workerReady, loading, onRefresh }: { api: Api; sourceSite: SourceSite; focusSourceSessions: boolean; overview: Overview | null; connected: boolean; workerReady: boolean; loading: boolean; onRefresh: () => void }) {
   const storage = overview?.storage ?? overview?.worker?.storage;
   const engine = overview?.worker?.engine;
   return <><div className="page-heading"><div><div className="eyebrow">SERVER</div><h1>Alles im Blick.</h1><p>Verbindung, Speicher und der aktuelle Betrieb von Vela.</p></div><button className="button secondary" onClick={onRefresh}><Icon name="refresh" size={17} />Aktualisieren</button></div>
   {loading ? <ListSkeleton /> : <div className="server-grid"><section className="server-panel"><div className="section-heading"><h2>Verbindung</h2><Icon name="server" /></div><dl className="status-list"><div><dt>Vela</dt><dd><span className={`status-dot ${connected ? 'good' : 'warning'}`} />{connected ? 'Erreichbar' : 'Nicht erreichbar'}</dd></div><div><dt>Download-Dienst</dt><dd><span className={`status-dot ${workerReady ? 'good' : 'warning'}`} />{workerReady ? 'Bereit' : 'Keine aktuelle Verbindung'}</dd></div><div><dt>Letzte Rückmeldung</dt><dd>{overview?.worker?.heartbeat_at ? new Date(overview.worker.heartbeat_at).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Noch keine'}</dd></div><div><dt>Version</dt><dd>{overview?.version ?? '–'}</dd></div></dl>{engine && <details className="engine-details"><summary>Versionsdetails</summary>{typeof engine === 'string' ? <p>{engine}</p> : <dl>{Object.entries(engine).filter(([, value]) => ['string', 'number'].includes(typeof value)).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{String(value)}</dd></div>)}</dl>}</details>}</section><StorageCard storage={storage} /><section className="server-panel activity-summary"><h2>Aufträge</h2><div className="stats-grid">{([{ label: 'In der Warteschlange', value: overview?.counts?.queued }, { label: 'In Bearbeitung', value: overview?.counts?.active }, { label: 'Abgeschlossen', value: overview?.counts?.completed }, { label: 'Fehlgeschlagen', value: overview?.counts?.failed }]).map(item => <div key={item.label}><strong>{item.value ?? '–'}</strong><span>{item.label}</span></div>)}</div></section></div>}
+  <SourceSessions api={api} initialSite={sourceSite} focusOnOpen={focusSourceSessions} />
   </>;
 }
+function sessionSite(job: Job): SourceSite | null { return ['audience_restricted', 'login_required'].includes(job.error_code ?? '') ? sourceSiteForUrl(job.url) : null; }
 function ListSkeleton() { return <div className="list-skeleton" aria-busy="true" aria-label="Aufträge werden geladen"><span /><span /><span /></div>; }

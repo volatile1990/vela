@@ -80,7 +80,7 @@ class Worker:
         self.settings = settings
         self.db = db or Database(settings.db_path)
         self.engine = engine or Engine(timeout=settings.job_timeout_seconds,
-            probe_timeout=settings.probe_timeout_seconds)
+            probe_timeout=settings.probe_timeout_seconds, credentials_dir=settings.credentials_dir)
         self.storage = storage or Storage(settings.download_dir, marker=settings.storage_marker_name,
             marker_value=settings.storage_marker, reserve_bytes=settings.min_free_bytes)
         self.stop = asyncio.Event()
@@ -151,9 +151,12 @@ class Worker:
                     raise EngineError("Das Arbeitsbudget wurde erreicht.", "work_full")
 
     def recover(self) -> None:
-        for job in self.db.active_jobs():
+        active = self.db.active_jobs()
+        active_ids = {job["id"] for job in active}
+        for job in active:
             directory = self.work_path(job["id"])
             recover_process(directory)
+            self.clear_session_copy(directory)
             if job.get("cancel_requested"):
                 self.db.update_job(job["id"], status="cancelled", phase="cancelled", finished_at=utcnow())
                 self.cleanup(directory)
@@ -161,6 +164,26 @@ class Worker:
                 self.db.update_job(job["id"], status="waiting_storage", phase="finalizing", error=None, error_code=None)
             else:
                 self.db.update_job(job["id"], status="queued", phase="queued", error=None, error_code=None)
+        # A previously reconciled queued attempt can still carry a crash
+        # remnant. Only known UUID job directories and the fixed private name
+        # are touched; media partials remain available for resume.
+        for directory in self.settings.work_dir.iterdir():
+            if not directory.is_dir() or directory.is_symlink() or directory.name in active_ids:
+                continue
+            try:
+                checked = self.work_path(directory.name)
+            except (ValueError, EngineError):
+                continue
+            if self.db.get_job(directory.name) is not None:
+                recover_process(checked)
+                self.clear_session_copy(checked)
+
+    @staticmethod
+    def clear_session_copy(directory: Path) -> None:
+        try:
+            (directory / ".vela-cookies.txt").unlink(missing_ok=True)
+        except OSError:
+            raise EngineError("Die temporäre Sitzung eines unterbrochenen Auftrags konnte nicht bereinigt werden.", "session_cleanup") from None
 
     async def _heartbeat(self) -> None:
         while True:
@@ -211,6 +234,11 @@ class Worker:
             if kind == "metadata":
                 self.db.update_job(job_id, metadata=payload, title=payload["title"],
                     media_id=payload["id"], extractor=payload["extractor"])
+            elif kind == "source_session":
+                current = self.db.get_job(job_id)
+                metadata = dict(current.get("metadata") or {}) if current else {}
+                metadata.update(payload)
+                self.db.update_job(job_id, metadata=metadata)
             elif kind == "postprocessing":
                 self.db.update_job(job_id, status="postprocessing", phase="postprocessing")
             elif kind == "progress" and time.monotonic() - last_progress >= 1:
