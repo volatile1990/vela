@@ -248,7 +248,7 @@ def test_later_totp_authenticated_false_remains_rejected_even_with_pending_marke
     assert not any(path=="/graphql/query" for _,path in transport.calls)
 
 
-@pytest.mark.parametrize("login,reason",[("twofactor_feedback","feedback_required"),("twofactor_challenge","challenge_required"),("twofactor_challenge_url","challenge_required"),("twofactor_status_fail","authentication_rejected"),("twofactor_http_error","authentication_rejected")])
+@pytest.mark.parametrize("login,reason",[("twofactor_feedback","feedback_required"),("twofactor_challenge","challenge_required"),("twofactor_challenge_url","challenge_required")])
 def test_feedback_or_challenge_on_initial_two_factor_step_blocks_automatic_totp(tmp_path,monkeypatch,login,reason):
     _,store,state,request_id=setup(tmp_path)
     transport=Transport(login=login);transport.install(monkeypatch)
@@ -256,6 +256,33 @@ def test_feedback_or_challenge_on_initial_two_factor_step_blocks_automatic_totp(
     assert result.state!="ready" and result.reason==reason
     assert not any(path.endswith("ajax/two_factor/") for _,path in transport.calls)
     assert state.consume_totp_attempt(request_id)
+
+
+@pytest.mark.parametrize("login",["twofactor_status_fail","twofactor_http_error"])
+def test_sdk_two_factor_pending_precedes_wire_status_and_resumes_without_password(tmp_path,monkeypatch,login):
+    _,store,state,request_id=setup(tmp_path)
+    transport=Transport(login=login,verify="feedback");transport.install(monkeypatch)
+    no_seed={key:value for key,value in ACCOUNT.items() if key!="totp_secret"}
+    result=client(store).refresh(no_seed,request_id,state)
+    assert result.state=="needs_attention" and result.reason=="two_factor_required"
+    pending=store.load(ACCOUNT["username"])
+    assert pending.pending_stage=="two_factor" and pending.two_factor_identifier==IDENTIFIER
+    assert not pending.totp_attempted and "sessionid" not in pending.cookies
+    assert transport.calls==[("GET","/"),("POST","/api/v1/web/accounts/login/ajax/")]
+    # The completed prior request is not rolled back to resume its pending API
+    # transaction. The next request spends only its own first TOTP budget.
+    state.finish(request_id,"error")
+    with state._database.transaction() as connection:
+        connection.execute("UPDATE instagram_auth SET last_requested=0 WHERE id=1")
+    next_request=state.request_refresh()
+    previous=len(transport.calls)
+    transport.before_verify=lambda:store.load(ACCOUNT["username"])
+    result=client(store).refresh(ACCOUNT,next_request,state)
+    assert result.state=="ready"
+    assert transport.saw_before_verify.pending_stage=="api_authenticated"
+    assert transport.calls[previous:]==[("POST","/accounts/login/ajax/two_factor/"),("GET","/graphql/query")]
+    assert state.consume_login_attempt(next_request)  # No fresh password spent.
+    assert not state.consume_totp_attempt(next_request)
 
 
 def test_rejection_diagnostic_contains_only_static_phase_booleans_and_counts(tmp_path,monkeypatch,caplog):
@@ -267,6 +294,7 @@ def test_rejection_diagnostic_contains_only_static_phase_booleans_and_counts(tmp
     text=records[0].getMessage()
     assert "auth_false_phase=totp" in text and "legit_two_factor_requested=True" in text and "sdk_normal_returned=True" in text
     assert "password_posts=1 totp_posts=1" in text
+    assert "http_status=200 status_class=ok identifier_valid=False" in text
     assert all(value not in text for value in (*ACCOUNT.values(),COOKIE,IDENTIFIER,CHECKPOINT,"123456"))
 
 

@@ -101,6 +101,9 @@ class _NetworkGuard:
         self.explicit_expired = False
         self.feedback = self.auth_rejected = False
         self.auth_false_phase = "none"
+        self.auth_false_http_status = 0
+        self.auth_false_status_class = "none"
+        self.auth_false_identifier_valid = False
         self.legit_two_factor_requested = self.sdk_normal_returned = False
 
     def check(self):
@@ -178,11 +181,16 @@ class _NetworkGuard:
                             # Instaloader handles this pending first step before
                             # authenticated:false; authentication completes only
                             # after a separate successful TOTP response.
+                            identifier_valid = isinstance(identifier, str) and 1 <= len(identifier) <= 1024 and not any(ord(c) < 32 or ord(c) == 127 for c in identifier)
                             password_two_factor = guard.phase == "login" and request.method == "POST" and parsed.path == "/api/v1/web/accounts/login/ajax/" and data.get("two_factor_required") is True
-                            pending_two_factor = password_two_factor and response.status_code == 200 and data.get("status") == "ok" and isinstance(identifier, str) and 1 <= len(identifier) <= 1024 and not any(ord(c) < 32 or ord(c) == 127 for c in identifier) and not (guard.challenge or guard.feedback)
+                            pending_two_factor = password_two_factor and identifier_valid and not (guard.challenge or guard.feedback)
                             guard.legit_two_factor_requested |= pending_two_factor
                             if data.get("authenticated") is False and not pending_two_factor and guard.auth_false_phase == "none":
                                 guard.auth_false_phase = guard.phase
+                                guard.auth_false_http_status = response.status_code if type(response.status_code) is int and 100 <= response.status_code <= 599 else 0
+                                wire_status = data.get("status")
+                                guard.auth_false_status_class = "ok" if wire_status == "ok" else "missing" if wire_status is None else "non_ok" if isinstance(wire_status, str) else "invalid_type"
+                                guard.auth_false_identifier_valid = identifier_valid
                             guard.auth_rejected |= data.get("authenticated") is False and not pending_two_factor
                             guard.auth_rejected |= password_two_factor and not pending_two_factor
                             if guard.phase in {"login", "totp"}:
@@ -223,8 +231,9 @@ class InstagramApiClient:
     def _warn_rejected(guard):
         if guard.auth_rejected:
             logging.getLogger(__name__).warning(
-                "Instagram authentication rejected: auth_false_phase=%s legit_two_factor_requested=%s sdk_normal_returned=%s password_posts=%d totp_posts=%d",
-                guard.auth_false_phase, guard.legit_two_factor_requested, guard.sdk_normal_returned, guard.password_posts, guard.totp_posts)
+                "Instagram authentication rejected: auth_false_phase=%s legit_two_factor_requested=%s sdk_normal_returned=%s password_posts=%d totp_posts=%d http_status=%d status_class=%s identifier_valid=%s",
+                guard.auth_false_phase, guard.legit_two_factor_requested, guard.sdk_normal_returned, guard.password_posts, guard.totp_posts,
+                guard.auth_false_http_status, guard.auth_false_status_class, guard.auth_false_identifier_valid)
 
     @staticmethod
     def _snapshot(loader, guard, fallback=None):
