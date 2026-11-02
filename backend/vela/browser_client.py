@@ -27,7 +27,8 @@ def public_status(value: dict) -> dict:
     state = value.get("state")
     if not isinstance(state, str) or state not in MESSAGES:
         raise ValueError("Invalid browser state")
-    result = {"configured": value.get("configured") is True, "state": state,
+    result = {"configured": value.get("configured") is True,
+              "totp_configured": value.get("totp_configured") is True, "state": state,
               "message": MESSAGES[state], "browser_available": value.get("browser_available") is True}
     for key in ("session_generation", "request_id", "completed_request_id"):
         number = value.get(key, 0)
@@ -49,12 +50,12 @@ class BrowserClient:
 
     async def request(self, method: str, path: str, payload: dict | None = None, *, screen: bool = False):
         # All callers use fixed paths. No URL, host or headers from a user are forwarded.
-        if path not in {"/status", "/account", "/login", "/action", "/screen"}:
+        if path not in {"/status", "/account", "/totp", "/login", "/action", "/screen"}:
             raise ValueError("Invalid browser operation")
         limit = 3 * 1024**2 if screen else 64 * 1024
         try:
             transport = httpx.AsyncHTTPTransport(uds=str(self.socket), retries=0)
-            timeout = 30 if path == "/account" else 12
+            timeout = 30 if path in {"/account", "/totp"} else 12
             async with httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(timeout, connect=2), trust_env=False) as client:
                 async with client.stream(method, "http://vela-browser" + path, json=payload) as response:
                     content = bytearray()

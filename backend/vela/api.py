@@ -225,6 +225,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def remove_instagram_account():
         return await app.state.browser_client.request("DELETE", "/account")
 
+    @app.put("/api/instagram-account/totp")
+    async def save_instagram_totp(request: Request):
+        value = await browser_body(request)
+        secret = value.get("secret")
+        if set(value) != {"secret"} or not isinstance(secret, str) or not 1 <= len(secret) <= 4096:
+            raise HTTPException(422, "Bitte einen gültigen Instagram-Einrichtungsschlüssel eingeben.")
+        return await app.state.browser_client.request("PUT", "/totp", {"secret": secret})
+
+    @app.delete("/api/instagram-account/totp")
+    async def remove_instagram_totp():
+        return await app.state.browser_client.request("DELETE", "/totp")
+
     @app.post("/api/instagram-account/login")
     async def login_instagram(request: Request):
         if await browser_body(request) != {}:

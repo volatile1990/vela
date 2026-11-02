@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from vela.browser_service import (AccountStorageError,AccountVault,ActionInput,BrowserController,
     BrowserControlError,BrowserSettings,HOME_URL,LOGIN_URL,LOGIN_PASSWORD_SELECTOR,PASSWORD_SELECTOR,
-    SUBMIT_SELECTOR,USERNAME_SELECTOR,allowed_browser_request,cookie_text_from_browser,create_app)
+    SUBMIT_SELECTOR,USERNAME_SELECTOR,OTP_INPUT_SELECTOR,allowed_browser_request,cookie_text_from_browser,create_app)
 from vela.instagram_auth import InstagramAuthState
 
 
@@ -206,7 +206,7 @@ def test_saved_account_login_once_exports_and_masks_screen(tmp_path):
             data=await control.screen();assert data.startswith(b"\x89PNG")
             screenshot=contexts[0].page.screenshot_options
             assert "path" not in screenshot and screenshot["mask"][0].selector==PASSWORD_SELECTOR
-            assert 'name="pass"' in PASSWORD_SELECTOR and 'name*="code"' in PASSWORD_SELECTOR
+            assert PASSWORD_SELECTOR.startswith("input:") and "textarea" in PASSWORD_SELECTOR and '[contenteditable="true"]' in PASSWORD_SELECTOR
             assert "synthetic-password" not in json.dumps(control.state.status())
             assert (control.settings.credentials_dir/"instagram.cookies.txt").is_file()
         finally:await control.close()
@@ -548,3 +548,144 @@ def test_private_http_contract_has_static_errors_and_no_credential_echo(tmp_path
         assert client.post("/action",json={"interaction_id":"a"*48,"kind":"key","key":"Control+L"}).status_code==422
         deleted=client.delete("/account")
         assert deleted.status_code==200 and not deleted.json()["configured"]
+
+
+SYNTHETIC_TOTP_KEY="GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+
+
+class OTPNode:
+    def __init__(self,page,kind,count=1):self.page,self.kind,self.number=page,kind,count
+    @property
+    def first(self):return self
+    async def count(self):return self.number
+    async def is_visible(self):return bool(self.number)
+    async def is_editable(self):return True
+    async def is_checked(self):return self.page.context.app_selected
+    def locator(self,selector):return OTPScope(self.page,picker=self.kind=="app-radio")
+    async def fill(self,value,**kwargs):
+        self.page.context.otp_value=value
+        self.page.context.otp_fills.append(value)
+    async def click(self,**kwargs):
+        context=self.page.context
+        context.method_clicks.append(self.kind)
+        if self.kind=="other-method":context.picker_open=True
+        elif self.kind=="app-radio":context.app_selected=True
+        elif self.kind=="picker-forward":context.picker_open=False;context.otp_text="Öffne deine Authentifizierungs-App"
+        elif self.kind=="otp-submit":context.otp_submits+=1
+
+
+class OTPScope:
+    def __init__(self,page,picker=False):self.page,self.picker=page,picker
+    async def count(self):return 1
+    def locator(self,selector):
+        count=0 if self.picker or selector!=OTP_INPUT_SELECTOR else self.page.context.otp_count
+        return OTPNode(self.page,"input",count)
+    def get_by_text(self,pattern,**kwargs):return OTPNode(self.page,"text",int(bool(pattern.search(self.page.context.otp_text))))
+    def get_by_role(self,role,*,name,exact):
+        if self.picker:
+            return OTPNode(self.page,"picker-forward",int(name=="Weiter" and self.page.context.app_selected))
+        return OTPNode(self.page,"otp-submit",int(name=="Weiter"))
+
+
+class OTPPage(FakePage):
+    def locator(self,selector):
+        if selector==OTP_INPUT_SELECTOR:return OTPNode(self,"input",self.context.otp_count)
+        return super().locator(selector)
+    def get_by_role(self,role,*,name,exact):
+        context=self.context
+        if name=="Authentifizierungs-App" and role=="radio" and context.picker_open:return OTPNode(self,"app-radio")
+        if name=="Andere Methode" and context.allow_picker and not context.picker_open:return OTPNode(self,"other-method")
+        return OTPNode(self,"absent",0)
+
+
+class OTPContext(FakeContext):
+    def __init__(self):
+        super().__init__()
+        self.otp_text="Öffne deine Authentifizierungs-App";self.otp_count=1
+        self.otp_value="999999";self.otp_fills=[];self.otp_submits=0;self.method_clicks=[]
+        self.picker_open=False;self.allow_picker=False;self.app_selected=False
+    async def new_page(self):self.page=OTPPage(self);self.pages.append(self.page);return self.page
+
+
+async def otp_controller(tmp_path,monkeypatch,*,configured=True):
+    context=OTPContext()
+    async def factory(settings):return context
+    async def synthetic_code(secret):return "123456"
+    monkeypatch.setattr("vela.browser_service.fresh_totp",synthetic_code)
+    control=BrowserController(options(tmp_path),browser_factory=factory)
+    control.vault.save("synthetic-user","synthetic-password")
+    if configured:control.vault.set_totp(SYNTHETIC_TOTP_KEY)
+    control.state.configure(True);control.state.publish(totp_configured=configured)
+    request=control.state.request_refresh()
+    await control._open_browser();control.page.url="https://www.instagram.com/accounts/login/two_factor/"
+    return control,context,request
+
+
+def test_otp_replaces_old_value_submits_once_and_budget_survives_restart(tmp_path,monkeypatch):
+    async def run():
+        control,context,request=await otp_controller(tmp_path,monkeypatch)
+        try:
+            assert await control._try_totp_once(request)
+            assert context.otp_value=="123456" and context.otp_fills==["123456"] and context.otp_submits==1
+            assert not await control._try_totp_once(request)
+            assert not InstagramAuthState(control.settings.state_dir).consume_totp_attempt(request)
+            assert context.otp_submits==1
+            assert "123456" not in json.dumps(control.state.status())
+        finally:await control.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("description",["Code aus WhatsApp eingeben","Öffne deine Authentifizierungs-App. Alternativ: SMS-Code eingeben","Öffne deine Authentifizierungs-App. E-Mail-Code"])
+def test_whatsapp_and_ambiguous_mixed_forms_never_receive_totp(tmp_path,monkeypatch,description):
+    async def run():
+        control,context,request=await otp_controller(tmp_path,monkeypatch)
+        context.otp_text=description
+        try:
+            assert not await control._try_totp_once(request)
+            assert context.otp_fills==[] and context.otp_submits==0
+            assert control.state.totp_attempt_available(request)
+        finally:await control.close()
+    asyncio.run(run())
+
+
+def test_otp_method_picker_chooses_only_app_radio_and_its_own_continue(tmp_path,monkeypatch):
+    async def run():
+        control,context,request=await otp_controller(tmp_path,monkeypatch)
+        context.otp_text="Code aus WhatsApp eingeben";context.allow_picker=True
+        try:
+            assert not await control._try_totp_once(request)
+            assert context.method_clicks==["other-method"] and control.state.totp_attempt_available(request)
+            assert not await control._try_totp_once(request)
+            assert context.method_clicks==["other-method","app-radio","picker-forward"]
+            assert context.otp_fills==[] and control.state.totp_attempt_available(request)
+            assert await control._try_totp_once(request)
+            assert context.otp_submits==1
+        finally:await control.close()
+    asyncio.run(run())
+
+
+def test_no_seed_or_ambiguous_otp_inputs_keep_human_flow(tmp_path,monkeypatch):
+    async def run():
+        control,context,request=await otp_controller(tmp_path,monkeypatch,configured=False)
+        try:
+            assert not await control._try_totp_once(request)
+            assert context.otp_fills==[] and context.method_clicks==[]
+            control.vault.set_totp(SYNTHETIC_TOTP_KEY);control.state.publish(totp_configured=True);context.otp_count=2
+            assert not await control._try_totp_once(request)
+            assert context.otp_fills==[] and control.state.totp_attempt_available(request)
+        finally:await control.close()
+    asyncio.run(run())
+
+
+def test_private_totp_api_returns_only_bool_and_static_validation_errors(tmp_path):
+    control,_=controller(tmp_path)
+    control.vault.save("synthetic-user","synthetic-password")
+    with TestClient(create_app(control.settings,control)) as client:
+        before=client.get("/status").json()
+        saved=client.put("/totp",json={"secret":SYNTHETIC_TOTP_KEY})
+        assert saved.status_code==200 and saved.json()["totp_configured"]
+        assert SYNTHETIC_TOTP_KEY not in saved.text and saved.json()["request_id"]==before["request_id"]
+        invalid=client.put("/totp",json={"secret":"synthetic-invalid-private-input"})
+        assert invalid.status_code==422 and "synthetic-invalid" not in invalid.text
+        removed=client.delete("/totp")
+        assert removed.status_code==200 and not removed.json()["totp_configured"]

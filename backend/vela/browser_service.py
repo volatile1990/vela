@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -22,17 +23,23 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .instagram_auth import InstagramAuthState, MESSAGES
 from .source_sessions import SourceSessionError, SourceSessionStore, validate_cookie_text
+from .totp import TOTPError, fresh_totp, parse_secret
 
 
 LOGIN_URL = "https://www.instagram.com/accounts/login/"
 HOME_URL = "https://www.instagram.com/"
 VIEWPORT = {"width": 1000, "height": 760}
 ALLOWED_KEYS = frozenset({"Enter", "Tab", "Backspace", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Escape", "Delete", "Home", "End", "Space"})
-PASSWORD_SELECTOR = 'input[type="password"],input[name="pass" i],input[name*="password" i],input[name*="code" i],input[autocomplete="current-password"],input[autocomplete="new-password"],input[autocomplete="one-time-code"]'
+PASSWORD_SELECTOR = 'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"]),textarea,[contenteditable="true"]'
 USERNAME_SELECTOR = 'input[name="username"]:visible,input[name="email"]:visible,input[autocomplete="username"]:visible,input[type="email"]:visible'
 LOGIN_PASSWORD_SELECTOR = 'input[name="password"]:visible,input[name="pass"]:visible,input[type="password"]:visible'
 SUBMIT_SELECTOR = 'button[type="submit"]:visible,input[type="submit"]:visible'
 LOGIN_SUBMIT_LABELS = ("Anmelden","Log in","Log In","Einloggen")
+OTP_INPUT_SELECTOR = 'input[name="approvals_code"]:visible,input[name="security_code"]:visible,input[name="verificationCode"]:visible,input[name="verification_code"]:visible,input[name="two_factor_code"]:visible,input[autocomplete="one-time-code"]:visible,input[inputmode="numeric"][maxlength="6"]:visible'
+OTP_SUBMIT_LABELS = ("Weiter","Bestätigen","Continue","Confirm")
+OTHER_METHOD_LABELS = ("Andere Methode","Andere Methode verwenden","Eine andere Methode verwenden","Andere Methode auswählen","Eine andere Methode auswählen","Andere Methode ausprobieren","Try another way","Try another method","Use another method")
+AUTHENTICATOR_METHOD_LABELS = ("Authentifizierungs-App","Authentifizierungsapp","Authenticator app","Authentication app")
+AUTHENTICATOR_PROMPTS = ("Öffne deine Authentifizierungs-App","Öffne deine Authentifizierungsapp","Open your authentication app","Open your authenticator app","Code aus deiner Authentifizierungs-App","Code aus der Authentifizierungs-App","code from your authentication app","code from your authenticator app")
 
 
 class BrowserControlError(ValueError):
@@ -185,6 +192,14 @@ class AccountVault:
 
     def save(self, username: str, password: str) -> None:
         validate_account(username,password)
+        data={"username":username.strip(),"password":password}
+        if self.configured():
+            previous=self.load()
+            if previous["username"].casefold()==username.strip().casefold() and previous.get("totp_secret"):
+                data["totp_secret"]=previous["totp_secret"]
+        self._save_data(data)
+
+    def _save_data(self, account:dict) -> None:
         with private_directory(self.directory) as descriptor:
             try: key=self._read(self._KEY,descriptor)
             except FileNotFoundError:
@@ -192,7 +207,7 @@ class AccountVault:
                 self._write(self._KEY,key,descriptor)
             if len(key)!=32: raise AccountStorageError()
             nonce=secrets.token_bytes(12)
-            data=json.dumps({"username":username.strip(),"password":password},ensure_ascii=False).encode("utf-8")
+            data=json.dumps(account,ensure_ascii=False).encode("utf-8")
             self._write(self._ACCOUNT,b"VELAIG1"+nonce+AESGCM(key).encrypt(nonce,data,self._AAD),descriptor)
 
     def load(self) -> dict:
@@ -202,10 +217,26 @@ class AccountVault:
                 data=self._read(self._ACCOUNT,descriptor)
             if len(key)!=32 or not data.startswith(b"VELAIG1") or len(data)<36: raise AccountStorageError()
             result=json.loads(AESGCM(key).decrypt(data[7:19],data[19:],self._AAD))
-            if set(result)!={"username","password"} or not all(isinstance(value,str) and value for value in result.values()): raise AccountStorageError()
+            if not isinstance(result,dict) or not {"username","password"}<=result.keys() or result.keys()-{"username","password","totp_secret"} or not all(isinstance(value,str) and value for value in result.values()): raise AccountStorageError()
+            if "totp_secret" in result:result["totp_secret"]=parse_secret(result["totp_secret"])
             return result
         except Exception:
             raise AccountStorageError() from None
+
+    def totp_configured(self) -> bool:
+        return bool(self.load().get("totp_secret")) if self.configured() else False
+
+    def set_totp(self,secret:str) -> None:
+        normalized=parse_secret(secret)
+        account=self.load()
+        account["totp_secret"]=normalized
+        self._save_data(account)
+
+    def remove_totp(self) -> None:
+        if not self.configured():return
+        account=self.load()
+        account.pop("totp_secret",None)
+        self._save_data(account)
 
     def delete(self) -> None:
         with private_directory(self.directory) as descriptor:
@@ -280,6 +311,8 @@ class BrowserController:
         self.last_account_write=0.0
         self.login_task=self.poll_task=None
         self.stopping=False
+        self._totp_method_selected_request=None
+        self._totp_picker_requested_request=None
 
     async def start(self):
         self.state.initialize()
@@ -290,7 +323,8 @@ class BrowserController:
             configured=await drain_thread(self.vault.configured)
             previous=self.state.status()
             if configured!=previous["configured"]: self.state.configure(configured)
-            self.state.publish(browser_available=False,interaction_id=None)
+            totp_configured=await drain_thread(self.vault.totp_configured) if hasattr(self.vault,"totp_configured") else False
+            self.state.publish(browser_available=False,interaction_id=None,totp_configured=totp_configured)
             self.poll_task=asyncio.create_task(self._poll())
         except Exception:
             self.owner.release()
@@ -477,6 +511,7 @@ class BrowserController:
                 await drain_thread(self._clear_profile)
                 await drain_thread(self.vault.save,username,password)
                 self.state.configure(True)
+                self.state.publish(totp_configured=await drain_thread(self.vault.totp_configured))
                 self.state.request_refresh(force=True)
                 self.last_account_write=time.monotonic()
         return self.state.status()
@@ -498,6 +533,20 @@ class BrowserController:
                 raise BrowserControlError("Bitte zuerst den Instagram-Zugang speichern.",409)
             if not self.state.request_refresh(force=True):
                 raise BrowserControlError("Bitte kurz warten, bevor die Anmeldung erneut gestartet wird.",429)
+        return self.state.status()
+
+    async def set_totp(self,secret:str):
+        normalized=parse_secret(secret)
+        async with self.operation_lock,self.control_lock:
+            if not self.state.status()["configured"]:raise BrowserControlError("Bitte zuerst den Instagram-Zugang speichern.",409)
+            await drain_thread(self.vault.set_totp,normalized)
+            self.state.publish(totp_configured=True)
+        return self.state.status()
+
+    async def remove_totp(self):
+        async with self.operation_lock,self.control_lock:
+            await drain_thread(self.vault.remove_totp)
+            self.state.publish(totp_configured=False)
         return self.state.status()
 
     async def _authenticated(self):
@@ -559,6 +608,90 @@ class BrowserController:
                 await button.click(timeout=2000)
                 return
 
+    def _is_two_factor_page(self):
+        if self.page is None or not allowed_browser_request(self.page.url,True):return False
+        path=urlsplit(self.page.url).path.lower()
+        return any(part in path for part in ("/two_factor","/two_step","/twofactor","/challenge","/checkpoint"))
+
+    async def _authenticator_prompt(self,scope):
+        other_channel=scope.get_by_text(re.compile(r"\b(?:WhatsApp|SMS|E-Mail|E‑Mail|email|text message|Textnachricht)\b",re.IGNORECASE)).first
+        if await other_channel.is_visible():return False
+        for phrase in AUTHENTICATOR_PROMPTS:
+            locator=scope.get_by_text(re.compile(re.escape(phrase),re.IGNORECASE)).first
+            if await locator.is_visible():return True
+        return False
+
+    async def _find_totp_form(self):
+        if not self._is_two_factor_page():return None
+        inputs=self.page.locator(OTP_INPUT_SELECTOR)
+        if await inputs.count()!=1:return None
+        otp=inputs.first
+        if not await otp.is_editable():return None
+        candidates=[otp.locator("xpath=ancestor::form[1]"),otp.locator("xpath=ancestor::*[@role='form' or @role='dialog'][1]")]
+        candidates.extend(otp.locator("xpath="+"/".join([".."]*depth)) for depth in range(1,7))
+        for scope in candidates:
+            if await scope.count()!=1:continue
+            if await scope.locator("xpath=self::body | self::html").count():continue
+            if await scope.locator(OTP_INPUT_SELECTOR).count()!=1 or await scope.locator(LOGIN_PASSWORD_SELECTOR).count():continue
+            if not await self._authenticator_prompt(scope):continue
+            submits=[]
+            for label in OTP_SUBMIT_LABELS:
+                button=scope.get_by_role("button",name=label,exact=True)
+                if await button.count()==1 and await button.is_visible():submits.append(button)
+            if len(submits)==1:return otp,submits[0]
+        return None
+
+    async def _choose_totp_method(self,request_id):
+        if not self._is_two_factor_page() or self._totp_method_selected_request==request_id:return False
+        for label in AUTHENTICATOR_METHOD_LABELS:
+            for role in ("radio","button"):
+                choice=self.page.get_by_role(role,name=label,exact=True)
+                if await choice.count()==1 and await choice.is_visible():
+                    await choice.click(timeout=3000)
+                    self._totp_method_selected_request=request_id
+                    if role=="radio":
+                        # Only a checked app radio in its own semantic picker may
+                        # advance. Never press a page-global confirmation.
+                        with suppress(Exception):
+                            if await choice.is_checked():
+                                for picker in (choice.locator("xpath=ancestor::form[1]"),choice.locator("xpath=ancestor::*[@role='dialog' or @role='form'][1]")):
+                                    if await picker.count()!=1 or await picker.locator(OTP_INPUT_SELECTOR).count():continue
+                                    forwards=[]
+                                    for forward_label in ("Weiter","Continue"):
+                                        forward=picker.get_by_role("button",name=forward_label,exact=True)
+                                        if await forward.count()==1 and await forward.is_visible():forwards.append(forward)
+                                    if len(forwards)==1:
+                                        await forwards[0].click(timeout=3000)
+                                        break
+                    return True
+        if self._totp_picker_requested_request==request_id:return False
+        for label in OTHER_METHOD_LABELS:
+            button=self.page.get_by_role("button",name=label,exact=True)
+            if await button.count()==1 and await button.is_visible():
+                await button.click(timeout=3000)
+                self._totp_picker_requested_request=request_id
+                return True
+        return False
+
+    async def _try_totp_once(self,request_id):
+        if not self.state.totp_attempt_available(request_id):return False
+        form=await self._find_totp_form()
+        if form is None:
+            await self._choose_totp_method(request_id)
+            return False
+        otp,submit=form
+        if not self.state.consume_totp_attempt(request_id):return False
+        account=await drain_thread(self.vault.load)
+        secret=account.get("totp_secret")
+        if not secret:return False
+        code=await fresh_totp(secret)
+        del account,secret
+        try:
+            await otp.fill(code,timeout=5000)
+            await submit.click(timeout=5000)
+            return True
+        finally:del code
+
     async def _run_login(self,request_id):
         try:
             async with self.control_lock:
@@ -575,12 +708,14 @@ class BrowserController:
                     if await self._export_ready(request_id):return
                     if not attempted:
                         with suppress(Exception): attempted=await self._try_submit_once(request_id)
+                    with suppress(Exception):await self._try_totp_once(request_id)
                 await asyncio.sleep(min(1,self.settings.poll_interval))
             self.state.finish(request_id,"needs_attention",browser_available=True,interaction_id=self.interaction_id)
             deadline=time.monotonic()+self.settings.challenge_timeout
             while time.monotonic()<deadline:
                 async with self.control_lock:
                     if await self._export_ready(request_id):return
+                    with suppress(Exception):await self._try_totp_once(request_id)
                 await asyncio.sleep(min(1,self.settings.poll_interval))
             async with self.control_lock: await self._close_browser()
             self.state.finish(request_id,"error",message="Die Bestätigungszeit ist abgelaufen. Bitte die Anmeldung erneut öffnen.")
@@ -629,6 +764,11 @@ class AccountInput(BaseModel):
     model_config=ConfigDict(extra="forbid")
     username:str=Field(min_length=1,max_length=254,repr=False)
     password:str=Field(min_length=1,max_length=4096,repr=False)
+
+
+class TOTPInput(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    secret:str=Field(min_length=1,max_length=4096,repr=False)
 
 
 class ActionInput(BaseModel):
@@ -685,6 +825,8 @@ def create_app(settings:BrowserSettings|None=None,controller:BrowserController|N
     async def control_error(request,error):return JSONResponse({"detail":str(error)},error.status_code)
     @app.exception_handler(AccountStorageError)
     async def storage_error(request,error):return JSONResponse({"detail":"Der geschützte Zugangsspeicher ist nicht verfügbar."},503)
+    @app.exception_handler(TOTPError)
+    async def totp_error(request,error):return JSONResponse({"detail":"Der Instagram-Einrichtungsschlüssel ist ungültig oder nicht unterstützt."},422)
 
     @app.get("/status")
     async def status_endpoint():return controller.state.status()
@@ -692,6 +834,10 @@ def create_app(settings:BrowserSettings|None=None,controller:BrowserController|N
     async def account_endpoint(account:AccountInput):return await controller.save_account(account.username,account.password)
     @app.delete("/account")
     async def delete_endpoint():return await controller.delete_account()
+    @app.put("/totp")
+    async def totp_endpoint(body:TOTPInput):return await controller.set_totp(body.secret)
+    @app.delete("/totp")
+    async def delete_totp_endpoint():return await controller.remove_totp()
     @app.post("/login")
     async def login_endpoint():return await controller.login()
     @app.post("/action")

@@ -477,6 +477,19 @@ svg { display: inline-block; flex-shrink: 0; vertical-align: middle; }
 .ig-fields input { width: 100%; font-size: 15px; min-height: 44px; }
 .ig-account-actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 18px 0 13px; }
 .ig-replace { margin: 10px 0 20px; }
+.ig-totp { margin-top: 24px; padding-top: 22px; border-top: 1px solid var(--line); }
+.ig-totp h4 span { font-weight: 400; color: var(--muted); font-size: 12px; }
+.ig-totp-form fieldset { border: 0; padding: 0; margin: 18px 0 12px; min-width: 0; }
+.ig-totp-form label { display: block; color: #d3dce9; font-size: 12px; margin-bottom: 8px; }
+.ig-totp-row { display: flex; align-items: stretch; gap: 10px; }
+.ig-totp-row input { flex: 1; width: 100%; min-width: 0; font-size: 16px; }
+.ig-totp-row .button { flex-shrink: 0; min-height: 44px; }
+.ig-totp-remove { margin: 0 0 7px; }
+.ig-totp-qr { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 12px 0; }
+.ig-totp-qr .button { min-height: 44px; }
+.ig-totp-instructions { font-size: 12px; line-height: 1.9; color: var(--muted); margin-top: 15px; }
+.ig-totp-instructions summary { cursor: pointer; color: #d5deeb; padding: 4px 0; }
+.ig-totp-instructions p { max-width: 700px; }
 .ig-confirmation { margin-top: 18px; }
 .ig-confirmation > .source-note { margin: 10px 0 0; }
 .ig-live-browser { margin-top: 22px; padding: 20px; border: 1px solid #526177; border-radius: 9px; background: #131c28; }
@@ -516,6 +529,7 @@ svg { display: inline-block; flex-shrink: 0; vertical-align: middle; }
   .ig-account-state { font-size: 12px; }
   .ig-live-browser { padding: 14px 11px; margin-inline: -5px; }
   .ig-text-input > div { flex-direction: column; }
+  .ig-totp-row { flex-direction: column; }
   .ig-text-input .button { min-height: 44px; }
   .ig-scroll-actions { gap: 3px; }
   .ig-scroll-actions .button { font-size: 11px; padding-inline: 9px; }

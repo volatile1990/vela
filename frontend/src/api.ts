@@ -5,6 +5,7 @@ export interface InstagramAccountStatus {
   configured: boolean; state: 'unconfigured' | 'idle' | 'logging_in' | 'ready' | 'needs_attention' | 'error';
   message: string; session_generation: number; request_id: number; completed_request_id: number;
   interaction_id: string | null; browser_available: boolean; updated_at: string | null;
+  totp_configured?: boolean;
 }
 export type InstagramAction = { interaction_id: string; kind: 'click' | 'text' | 'key' | 'scroll'; x?: number; y?: number; text?: string; key?: string; delta?: number };
 export type SourceSite = 'instagram' | 'youtube' | 'tiktok' | 'facebook' | 'x';
@@ -88,6 +89,8 @@ export class Api {
   saveInstagramAccount = (username: string, password: string) => this.request<InstagramAccountStatus>('/instagram-account', { username, password }, undefined, 'PUT');
   loginInstagramAccount = () => this.request<InstagramAccountStatus>('/instagram-account/login', {});
   removeInstagramAccount = () => this.request<InstagramAccountStatus>('/instagram-account', undefined, undefined, 'DELETE');
+  saveInstagramTotp = (secret: string) => this.request<InstagramAccountStatus>('/instagram-account/totp', { secret }, undefined, 'PUT');
+  removeInstagramTotp = () => this.request<InstagramAccountStatus>('/instagram-account/totp', undefined, undefined, 'DELETE');
   instagramAction = (action: InstagramAction) => this.request<InstagramAccountStatus>('/instagram-account/action', action);
   async instagramScreen(signal?: AbortSignal): Promise<Blob> {
     const response = await fetch('/api/instagram-account/screen', { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'image/png' }, signal });

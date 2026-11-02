@@ -25,7 +25,7 @@ SAFE_MESSAGES = frozenset(MESSAGES.values()) | {
     "Der gespeicherte Instagram-Zugang konnte nicht sicher gelesen werden.",
     "Das Browserfenster konnte nicht geöffnet werden. Bitte später erneut versuchen.",
 }
-_DEFAULT = {"configured": False, "state": "unconfigured", "message": MESSAGES["unconfigured"],
+_DEFAULT = {"configured": False, "totp_configured": False, "state": "unconfigured", "message": MESSAGES["unconfigured"],
     "session_generation": 0, "request_id": 0, "completed_request_id": 0,
     "interaction_id": None, "browser_available": False, "updated_at": None}
 
@@ -42,6 +42,15 @@ class InstagramAuthState:
         with self._database.connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("CREATE TABLE IF NOT EXISTS instagram_auth(id INTEGER PRIMARY KEY CHECK(id=1),value TEXT NOT NULL,last_requested REAL NOT NULL DEFAULT 0,browser_seen REAL NOT NULL DEFAULT 0,login_attempted INTEGER NOT NULL DEFAULT 0)")
+            # Serialize upgrades because API, worker and sidecar may start together.
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                columns={row["name"] for row in connection.execute("PRAGMA table_info(instagram_auth)")}
+                if "totp_attempted" not in columns:connection.execute("ALTER TABLE instagram_auth ADD COLUMN totp_attempted INTEGER NOT NULL DEFAULT 0")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
             connection.execute("INSERT OR IGNORE INTO instagram_auth(id,value) VALUES(1,?)", (json.dumps(_DEFAULT),))
 
     def status(self) -> dict:
@@ -89,6 +98,7 @@ class InstagramAuthState:
         with self._database.transaction() as connection:
             row = connection.execute("SELECT value FROM instagram_auth WHERE id=1").fetchone()
             current = json.loads(row["value"])
+            if not configured:current["totp_configured"]=False
             current.update(configured=bool(configured), state="idle" if configured else "unconfigured", message=MESSAGES["idle" if configured else "unconfigured"], completed_request_id=current["request_id"], browser_available=False, interaction_id=None, updated_at=utcnow())
             connection.execute("UPDATE instagram_auth SET value=?,last_requested=0 WHERE id=1", (json.dumps(current),))
         return self.status()
@@ -131,6 +141,22 @@ class InstagramAuthState:
                 return False
             connection.execute("UPDATE instagram_auth SET login_attempted=? WHERE id=1", (request_id,))
             return True
+
+    def consume_totp_attempt(self, request_id: int) -> bool:
+        self.initialize()
+        with self._database.transaction() as connection:
+            row=connection.execute("SELECT value,totp_attempted FROM instagram_auth WHERE id=1").fetchone()
+            current=json.loads(row["value"])
+            if request_id!=current["request_id"] or request_id<=row["totp_attempted"] or request_id<=current["completed_request_id"] or not current.get("totp_configured",False):return False
+            connection.execute("UPDATE instagram_auth SET totp_attempted=? WHERE id=1",(request_id,))
+            return True
+
+    def totp_attempt_available(self,request_id:int) -> bool:
+        self.initialize()
+        with self._database.connection() as connection:
+            row=connection.execute("SELECT value,totp_attempted FROM instagram_auth WHERE id=1").fetchone()
+            current=json.loads(row["value"])
+            return bool(current.get("totp_configured",False) and request_id==current["request_id"] and request_id>current["completed_request_id"] and request_id>row["totp_attempted"])
 
     def finish(self, request_id: int, state: str, *, message: str | None = None, interaction_id: str | None = None, browser_available: bool = False) -> dict:
         if state not in {"ready", "needs_attention", "error"} or (message is not None and message not in SAFE_MESSAGES):

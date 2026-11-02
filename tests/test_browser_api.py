@@ -97,3 +97,45 @@ def test_browser_client_strips_identity_and_errors(monkeypatch, tmp_path):
     with pytest.raises(HTTPException) as error:
         asyncio.run(BrowserClient(tmp_path / "control.sock").request("POST", "/login", {}))
     assert error.value.status_code == 503 and "NEVER" not in error.value.detail
+
+
+def test_totp_secret_only_reaches_fixed_socket_route_and_never_returns(client):
+    api, calls = client
+    body = {"secret": "SYNTHETIC-TOTP-SECRET"}
+    response = api.put("/api/instagram-account/totp", json=body)
+    assert response.status_code == 200
+    assert calls == [("PUT", "/totp", body, False)]
+    assert "SYNTHETIC" not in response.text and "secret" not in response.json()
+    assert response.json()["totp_configured"] is False
+    assert response.headers["cache-control"] == "no-store"
+    assert api.delete("/api/instagram-account/totp").status_code == 200
+    assert calls[-1] == ("DELETE", "/totp", None, False)
+    assert len(calls) == 2  # Neither operation logs in or deletes the account.
+
+
+@pytest.mark.parametrize("body", [{}, {"secret": ""}, {"secret": []}, {"secret": True},
+    {"secret": "x" * 4097}, {"secret": "PRIVATE", "username": "PRIVATE"}])
+def test_invalid_totp_inputs_never_forward_or_echo(client, body):
+    api, calls = client
+    response = api.put("/api/instagram-account/totp", json=body)
+    assert response.status_code == 422 and calls == []
+    assert "PRIVATE" not in response.text
+
+
+def test_totp_mutations_require_same_origin(client):
+    api, calls = client
+    foreign = {"Origin": "https://foreign.invalid"}
+    assert api.put("/api/instagram-account/totp", json={"secret": "PRIVATE"}, headers=foreign).status_code == 403
+    assert api.delete("/api/instagram-account/totp", headers=foreign).status_code == 403
+    assert calls == []
+
+
+def test_totp_status_is_strict_boolean_and_socket_path_is_finite(monkeypatch, tmp_path):
+    assert public_status({**STATUS, "totp_configured": True})["totp_configured"] is True
+    assert public_status({**STATUS, "totp_configured": "PRIVATE"})["totp_configured"] is False
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={**STATUS, "totp_configured": True, "secret": "PRIVATE"}))
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **_: transport)
+    result = asyncio.run(BrowserClient(tmp_path / "control.sock").request("PUT", "/totp", {"secret": "PRIVATE"}))
+    assert result["totp_configured"] is True and "PRIVATE" not in json.dumps(result)
+    with pytest.raises(ValueError):
+        asyncio.run(BrowserClient(tmp_path / "control.sock").request("PUT", "/totp/anything", {}))
