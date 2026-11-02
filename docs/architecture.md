@@ -83,7 +83,7 @@ Die Container laufen ohne Root, ohne Docker-Socket und mit begrenzten Schreibber
 
 ## Bereitstellung, Prüfung und Erweiterungen
 
-Vorgesehen ist **https://vela.home.arpa** am vorhandenen Caddy. Containerbuild, Mount-/Startprüfung, Netzregeln und Hosteinrichtung sind vorbereitet. Produktivstart, DNS/TLS und Releasezugang werden erst nach Prüfung bestätigt. Auslieferbare Versionen folgen dem vorhandenen Orbit-Verfahren.
+Vela läuft unter **https://vela.home.arpa** am vorhandenen Caddy und ist in NEXUS verlinkt. Containerbuild, Mount-/Startprüfung, Netzregeln, DNS/TLS und echte Downloads bis zum UNAS sind geprüft; Einzelheiten stehen in der [Abnahme](verification.md). Die Bereitstellung erfolgt direkt auf dem Heimserver. Eine Orbit-Veröffentlichung findet ausschließlich auf ausdrücklichen Nutzerauftrag statt.
 
 Die lokale Prüfung verwendet `python -m pytest` sowie im Frontend `npm test` und `npm run build`; Voraussetzungen stehen im [README](../README.md). Tests decken unter anderem Host-/Origin-Prüfung, direkten Zugang ohne Anmeldung, Queue, Abbruch, Wiederanlauf, Speicherprüfung und Browser-Arbeitsabläufe ab. Plattformtests mit realen Quellen bleiben zusätzlich erforderlich.
 

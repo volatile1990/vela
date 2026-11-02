@@ -46,7 +46,7 @@ docker build --target worker -t vela-worker:1.0.0 .
 docker build --target api -t vela-api:1.0.0 .
 ```
 
-Orbit erhält ein Linux-x86_64-Paket mit den tatsächlich gebauten Containerimages, Quellen, Hashmanifest und `install.sh`. Das Installationsskript ist für den bereits vorbereiteten Heimserver bestimmt; es richtet keine fremden Server oder NAS-Zugänge ein. Es prüft Payload und Imageidentitäten vor dem Wechsel. Es gibt keinen automatischen In-App-Updater; die Weboberfläche wird mit dem Serverrelease aktualisiert.
+Ein optionales Linux-x86_64-Buildpaket enthält die gebauten Containerimages, Quellen, Hashmanifest und `install.sh`. Das Installationsskript ist für den bereits vorbereiteten Heimserver bestimmt; es richtet keine fremden Server oder NAS-Zugänge ein. Es prüft Payload und Imageidentitäten vor dem Wechsel. Vela wird direkt auf dem Heimserver bereitgestellt; Orbit-Veröffentlichungen erfolgen ausschließlich auf ausdrücklichen Nutzerauftrag. Es gibt keinen automatischen In-App-Updater; die Weboberfläche wird mit dem Serverrelease aktualisiert.
 
 `deploy/unas_native.py`, `prepare_host.py`, `network.py`, `caddy.py` und `install_units.py` bilden den vorbereiteten Einrichtungsweg ab. Änderungen an gemeinsamem DNS, Caddy oder NEXUS müssen ihren aktuellen Zustand erhalten. Die privaten Vorherkopien auf dem Server sind technische Rückwege und gehören nicht ins Quellpaket.
 
