@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import shutil
+import socket
 import stat
 import time
 from contextlib import asynccontextmanager, contextmanager, suppress
@@ -218,6 +219,7 @@ class AccountVault:
 class ProfileOwnerLock:
     def __init__(self,path:Path): self.path,self.stream=path,None
     def acquire(self):
+        if self.stream is not None:return
         self.path.parent.mkdir(mode=0o700,exist_ok=True)
         if self.path.is_symlink(): raise AccountStorageError()
         fd=os.open(self.path,os.O_RDWR|os.O_CREAT|getattr(os,"O_NOFOLLOW",0),0o600)
@@ -340,7 +342,11 @@ class BrowserController:
         if self.page is not None: return
         if self.context is not None: await self._close_browser()
         self.last_activity=time.monotonic()
+        # Direct operator/fake entry points obey the same single-owner rule as start().
+        with private_directory(self.settings.secrets_dir):pass
+        self.owner.acquire()
         with private_directory(self.settings.profile_dir): pass
+        self._clear_stale_singletons()
         # Disable password saving in this dedicated profile; the account is kept in AES-GCM only.
         default=self.settings.profile_dir/"Default"
         if default.is_symlink(): raise AccountStorageError()
@@ -377,6 +383,57 @@ class BrowserController:
         self.interaction_id=secrets.token_hex(24)
         self.last_activity=time.monotonic()
         self.state.publish(browser_available=True,interaction_id=self.interaction_id)
+
+    def _profile_in_use(self,proc_dir:Path=Path("/proc")):
+        """Inspect the current PID namespace without signalling any process."""
+        if os.name!="posix":return False
+        if not proc_dir.is_dir():raise BrowserControlError("Der Browserprofilzustand konnte nicht sicher geprüft werden.",503)
+        wanted=str(self.settings.profile_dir.absolute()).encode()
+        for index,entry in enumerate(proc_dir.iterdir()):
+            if index>4096:raise BrowserControlError("Der Browserprofilzustand konnte nicht sicher geprüft werden.",503)
+            if not entry.name.isdigit():continue
+            try:arguments=(entry/"cmdline").read_bytes().split(b"\0")
+            except FileNotFoundError:continue  # A process may exit during inspection.
+            except PermissionError:raise BrowserControlError("Der Browserprofilzustand konnte nicht sicher geprüft werden.",503) from None
+            except OSError:continue
+            for position,argument in enumerate(arguments):
+                if argument==b"--user-data-dir="+wanted or (argument==b"--user-data-dir" and position+1<len(arguments) and arguments[position+1]==wanted):
+                    return True
+        return False
+
+    def _clear_stale_singletons(self):
+        """Remove only Chromium's fixed link names after exclusive ownership.
+
+        A recreated container cannot see its predecessor's PIDs. Our shared flock
+        serializes Vela owners; local processes using this profile are checked
+        separately. Link targets are never followed, removed, or used to kill a PID.
+        """
+        if self.owner.stream is None:raise BrowserControlError("Das Browserprofil ist nicht exklusiv gesperrt.",503)
+        with private_directory(self.settings.profile_dir) as descriptor:
+            links=[]
+            lock_target=None
+            for name in ("SingletonLock","SingletonCookie","SingletonSocket"):
+                try:info=os.stat(name if descriptor is not None else self.settings.profile_dir/name,dir_fd=descriptor,follow_symlinks=False)
+                except FileNotFoundError:continue
+                if not stat.S_ISLNK(info.st_mode):raise BrowserControlError("Das Browserprofil enthält unerwartete Sperrdateien.",503)
+                links.append(name)
+                if name=="SingletonLock":lock_target=os.readlink(name if descriptor is not None else self.settings.profile_dir/name,dir_fd=descriptor)
+            if not links:return
+            if self._profile_in_use():raise BrowserControlError("Das Browserprofil wird noch von einem laufenden Browser verwendet.",503)
+            if lock_target is not None:
+                try:
+                    hostname,pid_text=lock_target.rsplit("-",1)
+                    if not hostname or len(hostname)>255 or not pid_text.isdecimal() or not 1<int(pid_text)<2**31:raise ValueError
+                except ValueError:raise BrowserControlError("Die Browserprofilsperre konnte nicht sicher geprüft werden.",503) from None
+                if hostname==socket.gethostname():
+                    try:os.kill(int(pid_text),0)
+                    except ProcessLookupError:pass
+                    except (PermissionError,OSError):raise BrowserControlError("Das Browserprofil könnte noch verwendet werden.",503) from None
+                    else:raise BrowserControlError("Das Browserprofil wird noch von einem laufenden Prozess verwendet.",503)
+            for name in links:
+                try:os.unlink(name if descriptor is not None else self.settings.profile_dir/name,dir_fd=descriptor)
+                except FileNotFoundError:pass
+            if descriptor is not None:os.fsync(descriptor)
 
     def _page_closed(self,page):
         if page is self.page:

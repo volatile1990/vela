@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import stat
+import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -345,6 +346,66 @@ def test_gated_browser_launch_does_not_become_idle_before_preview_finishes(tmp_p
             release.set()
             await control.close()
     asyncio.run(run())
+
+
+@pytest.mark.skipif(os.name!="posix",reason="Chromium Linux singleton links")
+def test_recreated_container_singletons_are_unlinked_without_following_targets(tmp_path):
+    async def run():
+        control,contexts=controller(tmp_path)
+        control.settings.profile_dir.mkdir(mode=0o700)
+        outside=tmp_path/"outside-kept";outside.write_text("synthetic-profile-sentinel")
+        (control.settings.profile_dir/"SingletonLock").symlink_to("old-disposable-container-99999999")
+        for name in ("SingletonSocket","SingletonCookie"):(control.settings.profile_dir/name).symlink_to(outside)
+        retained=control.settings.profile_dir/"retained-profile-data";retained.write_text("synthetic-retained-profile")
+        try:
+            await control._open_browser()  # Lazy entry must acquire the owner lock too.
+            assert control.owner.stream is not None
+            assert not any(path.name.startswith("Singleton") for path in control.settings.profile_dir.iterdir())
+            assert outside.read_text()=="synthetic-profile-sentinel" and retained.read_text()=="synthetic-retained-profile"
+        finally:await control.close()
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(os.name!="posix",reason="Chromium Linux singleton links")
+def test_live_same_host_process_and_unexpected_singletons_are_preserved(tmp_path):
+    control,contexts=controller(tmp_path)
+    control.settings.secrets_dir.mkdir(mode=0o700);control.settings.profile_dir.mkdir(mode=0o700)
+    control.owner.acquire()
+    lock=control.settings.profile_dir/"SingletonLock"
+    lock.symlink_to(f"{socket.gethostname()}-{os.getpid()}")
+    try:
+        with pytest.raises(BrowserControlError,match="laufenden Prozess"):control._clear_stale_singletons()
+        assert lock.is_symlink()
+        lock.unlink();lock.symlink_to("old-disposable-container-99999999")
+        unexpected=control.settings.profile_dir/"SingletonSocket";unexpected.write_text("synthetic-do-not-remove")
+        with pytest.raises(BrowserControlError,match="unerwartete"):control._clear_stale_singletons()
+        assert lock.is_symlink() and unexpected.read_text()=="synthetic-do-not-remove"
+    finally:control.owner.release()
+
+
+@pytest.mark.skipif(os.name!="posix",reason="Chromium Linux singleton links")
+def test_singleton_cleanup_requires_owner_and_rejects_live_profile_process(tmp_path,monkeypatch):
+    control,_=controller(tmp_path)
+    control.settings.secrets_dir.mkdir(mode=0o700);control.settings.profile_dir.mkdir(mode=0o700)
+    lock=control.settings.profile_dir/"SingletonLock";lock.symlink_to("old-disposable-container-99999999")
+    with pytest.raises(BrowserControlError,match="exklusiv"):control._clear_stale_singletons()
+    control.owner.acquire()
+    try:
+        monkeypatch.setattr(control,"_profile_in_use",lambda:True)
+        with pytest.raises(BrowserControlError,match="laufenden Browser"):control._clear_stale_singletons()
+        assert lock.is_symlink()
+    finally:control.owner.release()
+
+
+@pytest.mark.skipif(os.name!="posix",reason="Linux proc inspection")
+def test_profile_process_detection_matches_only_exact_user_data_directory(tmp_path):
+    control,_=controller(tmp_path)
+    proc=tmp_path/"synthetic-proc";process=proc/"123";process.mkdir(parents=True)
+    command=process/"cmdline"
+    command.write_bytes(b"chromium\0--user-data-dir="+str(control.settings.profile_dir.absolute()).encode()+b"-different\0")
+    assert not control._profile_in_use(proc)
+    command.write_bytes(b"chromium\0--user-data-dir\0"+str(control.settings.profile_dir.absolute()).encode()+b"\0")
+    assert control._profile_in_use(proc)
 
 
 def test_action_bounds_stale_identity_and_preview_without_credentials(tmp_path):
