@@ -71,7 +71,12 @@ class Transport:
             elif self.login == "challenge":
                 data.update(status="fail", checkpoint_url=CHECKPOINT)
             elif self.two_factor:
-                data.update(two_factor_required=True, two_factor_info={"two_factor_identifier": IDENTIFIER})
+                data.update(two_factor_required=True, authenticated=False, user=True, two_factor_info={"two_factor_identifier": IDENTIFIER})
+                if self.login=="twofactor_feedback":data["message"]="feedback_required"
+                elif self.login=="twofactor_challenge":data["challenge"]={"url":CHECKPOINT}
+                elif self.login=="twofactor_challenge_url":data["challenge_url"]=CHECKPOINT
+                elif self.login=="twofactor_status_fail":data["status"]="fail"
+                elif self.login=="twofactor_http_error":response.status_code=400
             else:
                 data.update(authenticated=True, user=True)
                 session.cookies.set("sessionid", COOKIE)
@@ -84,6 +89,8 @@ class Transport:
                     data.update(message="feedback_required")
                 elif self.otp == "denied":
                     data.update(authenticated=False)
+                elif self.otp == "denied_twofactor":
+                    data.update(authenticated=False,two_factor_required=True,two_factor_info={"two_factor_identifier":IDENTIFIER})
         elif path == "/graphql/query":
             if self.before_verify:
                 self.saw_before_verify = self.before_verify()
@@ -219,6 +226,48 @@ def test_sdk_return_without_nonempty_sessionid_never_creates_login_provenance(tm
     assert result.state=="needs_attention"
     assert store.load(ACCOUNT["username"]).pending_stage=="verification"
     assert not any(path=="/graphql/query" for _,path in transport.calls)
+
+
+def test_initial_authenticated_false_is_only_pending_until_successful_totp_response(tmp_path,monkeypatch):
+    _,store,state,request_id=setup(tmp_path)
+    transport=Transport(verify="feedback");transport.install(monkeypatch)
+    transport.before_verify=lambda:store.load(ACCOUNT["username"])
+    result=client(store).refresh(ACCOUNT,request_id,state)
+    assert result.state=="ready"
+    assert transport.saw_before_verify.pending_stage=="api_authenticated"
+    assert transport.calls==[("GET","/"),("POST","/api/v1/web/accounts/login/ajax/"),("POST","/accounts/login/ajax/two_factor/"),("GET","/graphql/query")]
+    assert not state.consume_login_attempt(request_id) and not state.consume_totp_attempt(request_id)
+
+
+def test_later_totp_authenticated_false_remains_rejected_even_with_pending_marker(tmp_path,monkeypatch):
+    _,store,state,request_id=setup(tmp_path)
+    transport=Transport(otp="denied_twofactor");transport.install(monkeypatch)
+    result=client(store).refresh(ACCOUNT,request_id,state)
+    assert result.state=="error" and result.reason=="authentication_rejected"
+    assert store.load(ACCOUNT["username"]).pending_stage=="two_factor"
+    assert not any(path=="/graphql/query" for _,path in transport.calls)
+
+
+@pytest.mark.parametrize("login,reason",[("twofactor_feedback","feedback_required"),("twofactor_challenge","challenge_required"),("twofactor_challenge_url","challenge_required"),("twofactor_status_fail","authentication_rejected"),("twofactor_http_error","authentication_rejected")])
+def test_feedback_or_challenge_on_initial_two_factor_step_blocks_automatic_totp(tmp_path,monkeypatch,login,reason):
+    _,store,state,request_id=setup(tmp_path)
+    transport=Transport(login=login);transport.install(monkeypatch)
+    result=client(store).refresh(ACCOUNT,request_id,state)
+    assert result.state!="ready" and result.reason==reason
+    assert not any(path.endswith("ajax/two_factor/") for _,path in transport.calls)
+    assert state.consume_totp_attempt(request_id)
+
+
+def test_rejection_diagnostic_contains_only_static_phase_booleans_and_counts(tmp_path,monkeypatch,caplog):
+    _,store,state,request_id=setup(tmp_path)
+    transport=Transport(otp="denied");transport.install(monkeypatch)
+    assert client(store).refresh(ACCOUNT,request_id,state).reason=="authentication_rejected"
+    records=[record for record in caplog.records if record.name=="vela.instagram_api"]
+    assert len(records)==1
+    text=records[0].getMessage()
+    assert "auth_false_phase=totp" in text and "legit_two_factor_requested=True" in text and "sdk_normal_returned=True" in text
+    assert "password_posts=1 totp_posts=1" in text
+    assert all(value not in text for value in (*ACCOUNT.values(),COOKIE,IDENTIFIER,CHECKPOINT,"123456"))
 
 
 def test_real_challenge_cannot_be_promoted_by_simultaneous_feedback(tmp_path,monkeypatch):

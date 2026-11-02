@@ -690,7 +690,11 @@ def test_idle_decision_is_rechecked_after_waiting_for_browser_lock(tmp_path):
     asyncio.run(run())
 
 
-def test_gated_browser_launch_does_not_become_idle_before_preview_finishes(tmp_path):
+def test_gated_browser_launch_does_not_become_idle_before_preview_finishes(tmp_path,monkeypatch):
+    import vela.browser_service as browser_service
+    # Freeze controller time; Docker/SQLite scheduling must not
+    # consume the fixture's 100-ms idle budget. Do not patch asyncio's clock.
+    monkeypatch.setattr(browser_service,"time",SimpleNamespace(monotonic=lambda:100.0,time=time.time))
     async def run():
         entered=asyncio.Event();release=asyncio.Event();context=FakeContext()
         original_route=context.route
@@ -701,14 +705,31 @@ def test_gated_browser_launch_does_not_become_idle_before_preview_finishes(tmp_p
         context.route=delayed_route
         async def factory(settings):return context
         control=BrowserController(options(tmp_path),browser_factory=factory)
+        published=threading.Condition();cycles={"gated":0,"ready":0}
+        main_thread=threading.get_ident();original_publish=control.state.publish
+        def observe_publish(**fields):
+            result=original_publish(**fields)
+            if threading.get_ident()!=main_thread and control.context is context:
+                with published:
+                    if fields.get("browser_available") is False:cycles["gated"]+=1
+                    elif fields.get("browser_available") is True:cycles["ready"]+=1
+                    published.notify_all()
+            return result
+        def wait_cycles(kind,target):
+            with published:return published.wait_for(lambda:cycles[kind]>=target,timeout=5)
+        control.state.publish=observe_publish
         await control.start()
         try:
             opening=asyncio.create_task(control.open_login_preview())
             await entered.wait()
             assert control.context is context and control.last_activity>0
-            await asyncio.sleep(.03)
+            with published:gated_baseline=cycles["gated"]
+            # Two completed cycles ensure a poller that began before the gate
+            # cannot accidentally stand in for one that observed the launch.
+            assert await asyncio.to_thread(wait_cycles,"gated",gated_baseline+2)
+            assert not context.closed
             release.set();await opening
-            await asyncio.sleep(.03)
+            assert await asyncio.to_thread(wait_cycles,"ready",1)
             assert control.page is not None and not context.closed
             assert control.state.status()["browser_available"]
         finally:

@@ -100,6 +100,8 @@ class _NetworkGuard:
         self.challenge = self.rate_limited = self.network_failed = False
         self.explicit_expired = False
         self.feedback = self.auth_rejected = False
+        self.auth_false_phase = "none"
+        self.legit_two_factor_requested = self.sdk_normal_returned = False
 
     def check(self):
         if self.stop_event is not None and self.stop_event.is_set():
@@ -169,9 +171,20 @@ class _NetworkGuard:
                             if not candidate and isinstance(challenge, dict):
                                 candidate = challenge.get("url") or challenge.get("api_path")
                             guard.checkpoint_url = safe_checkpoint_url(candidate) or guard.checkpoint_url
-                            guard.challenge |= bool(challenge or data.get("checkpoint_url")) or data.get("message") in {"challenge_required", "checkpoint_required"}
+                            guard.challenge |= bool(challenge or data.get("checkpoint_url") or data.get("challenge_url") or guard.checkpoint_url) or data.get("message") in {"challenge_required", "checkpoint_required"}
                             guard.feedback |= data.get("message") == "feedback_required"
-                            guard.auth_rejected |= data.get("authenticated") is False
+                            two_factor_info = data.get("two_factor_info")
+                            identifier = two_factor_info.get("two_factor_identifier") if isinstance(two_factor_info, dict) else None
+                            # Instaloader handles this pending first step before
+                            # authenticated:false; authentication completes only
+                            # after a separate successful TOTP response.
+                            password_two_factor = guard.phase == "login" and request.method == "POST" and parsed.path == "/api/v1/web/accounts/login/ajax/" and data.get("two_factor_required") is True
+                            pending_two_factor = password_two_factor and response.status_code == 200 and data.get("status") == "ok" and isinstance(identifier, str) and 1 <= len(identifier) <= 1024 and not any(ord(c) < 32 or ord(c) == 127 for c in identifier) and not (guard.challenge or guard.feedback)
+                            guard.legit_two_factor_requested |= pending_two_factor
+                            if data.get("authenticated") is False and not pending_two_factor and guard.auth_false_phase == "none":
+                                guard.auth_false_phase = guard.phase
+                            guard.auth_rejected |= data.get("authenticated") is False and not pending_two_factor
+                            guard.auth_rejected |= password_two_factor and not pending_two_factor
                             if guard.phase in {"login", "totp"}:
                                 guard.auth_rejected |= guard.challenge or guard.feedback
                             if guard.phase == "verify":
@@ -205,6 +218,13 @@ class InstagramApiClient:
         loader.context.log = lambda *_args, **_kwargs: None
         loader.context.error = lambda *_args, **_kwargs: None
         return loader
+
+    @staticmethod
+    def _warn_rejected(guard):
+        if guard.auth_rejected:
+            logging.getLogger(__name__).warning(
+                "Instagram authentication rejected: auth_false_phase=%s legit_two_factor_requested=%s sdk_normal_returned=%s password_posts=%d totp_posts=%d",
+                guard.auth_false_phase, guard.legit_two_factor_requested, guard.sdk_normal_returned, guard.password_posts, guard.totp_posts)
 
     @staticmethod
     def _snapshot(loader, guard, fallback=None):
@@ -313,7 +333,10 @@ class InstagramApiClient:
                         identifier = pending[2]
                         stage = "two_factor"
                         self._save(username, cookies, stage, request_id, False, user_agent, identifier=identifier)
+                        if guard.auth_rejected:
+                            raise _ApiStop("challenge_required" if guard.challenge else "feedback_required" if guard.feedback else "authentication_rejected")
                     else:
+                        guard.sdk_normal_returned = True
                         cookies = self._snapshot(loader, guard)
                         if guard.auth_rejected:
                             raise _ApiStop("challenge_required" if guard.challenge else "feedback_required" if guard.feedback else "authentication_rejected")
@@ -331,6 +354,7 @@ class InstagramApiClient:
                 try:
                     guard.check()
                     loader.two_factor_login(code)
+                    guard.sdk_normal_returned = True
                 finally:
                     del code
                 cookies = self._snapshot(loader, guard, cookies)
@@ -349,6 +373,7 @@ class InstagramApiClient:
                     self._save(username, cookies, "checkpoint" if checkpoint or guard.challenge else stage if stage in {"two_factor", "ready", "api_authenticated"} else "blocked" if reason in {"credentials_rejected", "feedback_required", "authentication_rejected"} else "verification", request_id, attempted, user_agent, checkpoint, identifier if stage == "two_factor" else None)
             return self._result("error" if reason in {"credentials_rejected", "two_factor_rejected", "network_policy_blocked", "cancelled", "feedback_required", "authentication_rejected"} else "needs_attention", reason, cookies, checkpoint, user_agent)
         finally:
+            self._warn_rejected(guard)
             if loader is not None:
                 with suppress(Exception):
                     loader.close()
@@ -385,6 +410,7 @@ class InstagramApiClient:
                     saved.request_id if saved else 0, saved.totp_attempted if saved else False, user_agent, guard.checkpoint_url or checkpoint)
             return self._result("error" if reason == "feedback_required" else "needs_attention", reason, values, guard.checkpoint_url or checkpoint, user_agent)
         finally:
+            self._warn_rejected(guard)
             if loader is not None:
                 with suppress(Exception):
                     loader.close()
