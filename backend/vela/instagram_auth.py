@@ -24,6 +24,7 @@ SAFE_MESSAGES = frozenset(MESSAGES.values()) | {
     "Die Bestätigungszeit ist abgelaufen. Bitte die Anmeldung erneut öffnen.",
     "Der gespeicherte Instagram-Zugang konnte nicht sicher gelesen werden.",
     "Das Browserfenster konnte nicht geöffnet werden. Bitte später erneut versuchen.",
+    "Bitte die Anmeldung direkt in Instagram bestätigen und anschließend in Vela erneut anmelden.",
 }
 _DEFAULT = {"configured": False, "totp_configured": False, "state": "unconfigured", "message": MESSAGES["unconfigured"],
     "session_generation": 0, "request_id": 0, "completed_request_id": 0,

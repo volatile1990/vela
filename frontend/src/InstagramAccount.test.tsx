@@ -68,6 +68,28 @@ describe('Instagram-Zugang und Bestätigung', () => {
     expect(screen.queryByText(/never-display/)).not.toBeInTheDocument();
   });
 
+  it('führt ohne Livefenster zur Bestätigung in der Instagram-App und prüft danach die Sitzung', async () => {
+    const fetchMock = apiMock(status({ configured: true, state: 'needs_attention', browser_available: false }));
+    const user = userEvent.setup();
+    render(<InstagramAccount api={new Api()} />);
+    expect(await screen.findByText(/Prüfe die Instagram-App und schließe dort mögliche Hinweise oder Anmeldebestätigungen ab/)).toBeInTheDocument();
+    expect(screen.getByText('„Erneut versuchen“ prüft zuerst die gespeicherte Sitzung.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Bestätigung öffnen' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Erneut versuchen' }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/instagram-account/login', expect.objectContaining({ method: 'POST', body: '{}' }));
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith('/screen') || init?.method === 'PUT')).toBe(false);
+  });
+
+  it('behält ein vorhandenes Livefenster bei und nennt zusätzliche Freigaben in der Instagram-App', async () => {
+    apiMock(status({ configured: true, state: 'needs_attention', browser_available: true, interaction_id: 'interaction-1' }));
+    render(<InstagramAccount api={new Api()} />);
+    expect(await screen.findByText(/Öffne das Livefenster und folge den Hinweisen/)).toBeInTheDocument();
+    expect(screen.getByText(/Falls Instagram eine zusätzliche Freigabe verlangt, prüfe auch die Instagram-App/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Bestätigung öffnen' })).toBeInTheDocument();
+    expect(screen.getByText(/Mit einem hinterlegten Authenticator-Schlüssel erzeugt Vela benötigte App-Codes selbst/)).toBeInTheDocument();
+    expect(screen.queryByText(/Protokoll|Instaloader/)).not.toBeInTheDocument();
+  });
+
   it('behandelt einen fehlenden Authenticator-Status als nicht hinterlegt und benötigt zuerst einen Zugang', async () => {
     const fetchMock = apiMock(status());
     render(<InstagramAccount api={new Api()} />);

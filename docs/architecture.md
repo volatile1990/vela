@@ -32,11 +32,12 @@ flowchart LR
     C --> A[FastAPI und statisches React-Frontend]
     A --> Q[(SQLite auf lokaler SSD)]
     W[Worker und Scheduler] --> Q
-    A -->|Unixsocket| R[Instagram-Browserdienst]
+    A -->|Unixsocket| R[Instagram-Anmeldedienst]
     W --> T[(Anmelde-Steuerzustand auf SSD)]
     R --> T
-    R --> P[Eigenes Browserprofil und geschützter Zugang]
-    R -->|direkte Anmeldung| I
+    R --> P[Verschlüsselte Zugänge und API-Sitzung]
+    R -->|Instaloader-Anmeldung| I
+    R --> H[Bei Bedarf flüchtiger Bestätigungsbrowser]
     R --> K[Instagram-Sitzungsdatei]
     K --> E
     W --> E[yt-dlp mit EJS, Deno und FFmpeg]
@@ -52,7 +53,7 @@ API, Worker und Browserdienst sind getrennte Compose-Dienste. Netzregeln und Mou
 
 **Worker:** Ein exklusiver Worker übernimmt Jobs aus SQLite. Ein Download und ein separater Vorschauauftrag können gleichzeitig laufen. Auch Playlistauflösung läuft über die Engine. Jeder Vorgang erhält Arbeitsbereich, strukturierte Ausgabe, Zeit-/Ausgabelimits und Prozessgruppe; Abbruch erfasst auch FFmpeg. Der Worker veröffentlicht keinen HTTP-Port.
 
-**Instagram-Browserdienst:** Ein eigener Chromium-Browser mit Playwright übernimmt ausdrücklich hinterlegte Instagram-Zugangsdaten und behält ein eigenes Profil. Zugangsdaten werden mit AES-GCM in einem getrennten privaten Verzeichnis gespeichert. Der Browser besitzt keinen TCP-Steuerport; die API kommuniziert über einen Unixsocket. Eingriffe bei Anmeldebestätigungen erfolgen über kurzlebige Screenshots und begrenzte Eingabeaktionen. Navigation ist auf Instagram begrenzt, weitere benötigte Ressourcen stammen aus einer festen Domainliste. Zusätzlich blockiert die gemeinsame Egress-Firewall private Ziele. Persönliche Browserprofile und externe Downloadportale werden nicht verwendet.
+**Instagram-Anmeldedienst:** Instaloader übernimmt primär die Anmeldung und Prüfung der ausdrücklich hinterlegten Instagram-Zugänge. Ein verschlüsselter JSON-Sitzungszustand hält auch noch nicht bestätigte Sitzungen fest. Eine zusätzliche Sicherheitsfreigabe führt deshalb zur Bestätigung und zum Wiederverwenden dieses Zustands, statt erneut Passwörter zu senden. Zugangsdaten und Sitzungen liegen mit getrennten Verschlüsselungskontexten im privaten Speicher. Ein Browser mit Playwright/Chromium wird nur für eine erforderliche Bestätigung geöffnet; dafür erhält er einen flüchtigen Kontext mit den zugehörigen Instagram-Cookies. Der Dienst besitzt keinen TCP-Steuerport; die API kommuniziert über einen Unixsocket. Eingriffe erfolgen über kurzlebige, maskierte Screenshots und begrenzte Aktionen. Direkte HTTP-Anfragen und deren Weiterleitungen sind auf Instagram begrenzt. Zusätzlich blockiert die gemeinsame Egress-Firewall private Ziele. Persönliche Browserprofile und externe Downloadportale werden nicht verwendet.
 
 Ein separater SQLite-Steuerzustand enthält ausschließlich Status und begrenzte Erneuerungsanforderungen. Der Worker kann auf `waiting_auth` wechseln und gibt seinen Ausführungsslot frei. Nach neuer Sitzung wird der Auftrag automatisch wieder eingereiht. Ein dauerhaftes Budget verhindert wiederholte automatische Anmeldeversuche für denselben Downloadversuch; erst ein ausdrückliches Wiederholen erlaubt einen neuen Zyklus. Eine erfolgreiche Anmeldung oder jeder beliebige Videoabruf wird damit nicht garantiert.
 

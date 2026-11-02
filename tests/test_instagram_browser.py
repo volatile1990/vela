@@ -4,17 +4,20 @@ import json
 import os
 import stat
 import socket
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from vela.browser_service import (AccountStorageError,AccountVault,ActionInput,BrowserController,
     BrowserControlError,BrowserSettings,HOME_URL,LOGIN_URL,LOGIN_PASSWORD_SELECTOR,PASSWORD_SELECTOR,
-    SUBMIT_SELECTOR,USERNAME_SELECTOR,OTP_INPUT_SELECTOR,allowed_browser_request,cookie_text_from_browser,create_app)
+    SUBMIT_SELECTOR,USERNAME_SELECTOR,OTP_INPUT_SELECTOR,AUTHENTICATOR_CHOICE_SELECTOR,allowed_browser_request,cookie_text_from_browser,create_app)
 from vela.instagram_auth import InstagramAuthState
+from vela.instagram_api import InstagramApiClient
 
 
 @pytest.fixture(autouse=True)
@@ -93,16 +96,35 @@ class FakeContext:
     async def close(self):
         self.closed=True
         for page in self.pages:await page.close()
+    async def add_cookies(self,cookies):self.added_cookies=cookies
     async def cookies(self,*args):
         return [{"domain":".instagram.com","path":"/","secure":True,"httpOnly":True,"expires":time.time()+3600,
             "name":"sessionid" if self.authenticated else "csrftoken","value":"synthetic-session-value"}]
 
 
-def controller(tmp_path,result="ready",authenticated=False):
+def api_result(state="ready",url=None):
+    return SimpleNamespace(state=state,reason="synthetic_static",checkpoint_url=url,user_agent="synthetic-api-agent",
+        cookies=[{"domain":".instagram.com","path":"/","secure":True,"httpOnly":True,"expires":-1,
+            "name":"sessionid","value":"synthetic-api-session"}])
+
+
+class FakeApiClient:
+    def __init__(self,result="ready",reused=False):self.result=result;self.reused=reused;self.calls=[];self.adopted=[]
+    def refresh(self,account,request_id,state,*,stop_event=None):
+        self.calls.append(request_id)
+        consumed=self.reused or state.consume_login_attempt(request_id)
+        if self.result=="ready" and consumed:return api_result()
+        return api_result("needs_attention","https://www.instagram.com/challenge/synthetic/")
+    def accept_browser_session(self,account,cookies,*,stop_event=None):
+        self.adopted.append(cookies)
+        return api_result()
+
+
+def controller(tmp_path,result="ready",authenticated=False,api_client=None):
     contexts=[]
     async def factory(settings):
         context=FakeContext(result,authenticated);contexts.append(context);return context
-    return BrowserController(options(tmp_path),browser_factory=factory),contexts
+    return BrowserController(options(tmp_path),browser_factory=factory,api_client=api_client or FakeApiClient(result,authenticated)),contexts
 
 
 async def wait_state(control,state):
@@ -192,7 +214,7 @@ def test_cookie_export_filters_and_keeps_session_and_httponly():
     assert "synthetic-foreign" not in text
 
 
-def test_saved_account_login_once_exports_and_masks_screen(tmp_path):
+def test_saved_account_uses_api_exports_without_browser_and_preview_masks_screen(tmp_path):
     async def run():
         control,contexts=controller(tmp_path)
         await control.start()
@@ -200,9 +222,10 @@ def test_saved_account_login_once_exports_and_masks_screen(tmp_path):
             await control.save_account("synthetic-user","synthetic-password")
             ready=await wait_state(control,"ready")
             assert ready["session_generation"]==1 and ready["completed_request_id"]==1
-            assert contexts[0].page.submits==1
-            assert [value for _,value in contexts[0].page.fills]==["synthetic-user","synthetic-password"]
-            assert not contexts[0].overlay
+            assert contexts==[] and control.api_client.calls==[1]
+            assert not ready["browser_available"]
+            await control.open_login_preview()
+            assert contexts[0].page.submits==0 and contexts[0].page.fills==[]
             data=await control.screen();assert data.startswith(b"\x89PNG")
             screenshot=contexts[0].page.screenshot_options
             assert "path" not in screenshot and screenshot["mask"][0].selector==PASSWORD_SELECTOR
@@ -213,14 +236,16 @@ def test_saved_account_login_once_exports_and_masks_screen(tmp_path):
     asyncio.run(run())
 
 
-def test_persisted_browser_session_is_reused_without_password_submission(tmp_path):
+def test_persisted_api_session_is_reused_without_browser_or_password_submission(tmp_path):
     async def run():
         control,contexts=controller(tmp_path,authenticated=True)
         control.vault.save("synthetic-user","synthetic-password")
         await control.start()
         try:
             await control.login();await wait_state(control,"ready")
-            assert contexts[0].page.submits==0 and contexts[0].page.fills==[]
+            assert contexts==[]
+            with control.state._database.connection() as connection:
+                assert connection.execute("SELECT login_attempted FROM instagram_auth WHERE id=1").fetchone()[0]==0
         finally:await control.close()
     asyncio.run(run())
 
@@ -232,11 +257,13 @@ def test_challenge_to_ready_same_request_with_single_login_and_expiry(tmp_path):
         try:
             await control.save_account("synthetic-user","synthetic-password")
             attention=await wait_state(control,"needs_attention")
-            assert attention["completed_request_id"]==0 and contexts[0].page.submits==1
+            assert attention["completed_request_id"]==0 and contexts[0].page.submits==0
+            assert contexts[0].page.fills==[] and control._browser_ephemeral
+            assert contexts[0].added_cookies[0]["name"]=="sessionid"
             contexts[0].authenticated=True;contexts[0].page.url=HOME_URL
             ready=await wait_state(control,"ready")
             assert ready["request_id"]==1 and ready["completed_request_id"]==1 and ready["session_generation"]==1
-            assert contexts[0].page.submits==1
+            assert contexts[0].page.submits==0 and len(control.api_client.adopted)==1
         finally:await control.close()
     asyncio.run(run())
 
@@ -251,6 +278,236 @@ def test_restart_never_repeats_consumed_automatic_password_attempt(tmp_path):
         try:
             await wait_state(control,"needs_attention")
             assert contexts[0].page.submits==0 and contexts[0].page.fills==[]
+        finally:await control.close()
+    asyncio.run(run())
+
+
+def test_api_refresh_preserves_profile_but_explicit_account_mutations_clear_it(tmp_path):
+    async def run():
+        control,contexts=controller(tmp_path)
+        control.settings.profile_dir.mkdir(mode=0o700)
+        sentinel=control.settings.profile_dir/"synthetic-profile-sentinel"
+        sentinel.write_bytes(b"synthetic-retained-profile")
+        control.vault.save("synthetic-user","synthetic-password")
+        await control.start()
+        try:
+            await control.login()
+            await wait_state(control,"ready")
+            assert contexts==[] and sentinel.read_bytes()==b"synthetic-retained-profile"
+            control.api_store.save("synthetic-user",cookies={"csrftoken":"synthetic"},pending_stage="checkpoint")
+            await control.set_totp(SYNTHETIC_TOTP_KEY)
+            await control.remove_totp()
+            assert control.api_store.load("synthetic-user") is not None
+            control.last_account_write=0
+            await control.save_account("synthetic-user","synthetic-replacement")
+            assert control.api_store.load("synthetic-user") is None
+            assert not sentinel.exists()
+            sentinel.write_bytes(b"synthetic-new-profile")
+            await control.delete_account()
+            assert not sentinel.exists()
+            assert control.api_store.load("synthetic-user") is None
+        finally:await control.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("checkpoint",[None,"https://instagram.com.unrelated.invalid/challenge/synthetic/","https://www.instagram.com/"])
+def test_pending_api_without_safe_challenge_waits_for_explicit_same_request_retry(tmp_path,checkpoint):
+    class PendingApi(FakeApiClient):
+        def refresh(self,account,request_id,state,*,stop_event=None):
+            self.calls.append(request_id)
+            if len(self.calls)==1:
+                assert state.consume_login_attempt(request_id)
+                return api_result("needs_attention",checkpoint)
+            assert not state.consume_login_attempt(request_id)
+            return api_result()
+    async def run():
+        api=PendingApi();control,contexts=controller(tmp_path,api_client=api)
+        await control.start()
+        try:
+            await control.save_account("synthetic-user","synthetic-password")
+            attention=await wait_state(control,"needs_attention")
+            assert not attention["browser_available"] and attention["interaction_id"] is None
+            assert "direkt in Instagram" in attention["message"]
+            await asyncio.sleep(.04)
+            assert api.calls==[1] and contexts==[]
+            await control.login()
+            ready=await wait_state(control,"ready")
+            assert ready["request_id"]==1 and ready["completed_request_id"]==1 and api.calls==[1,1]
+        finally:await control.close()
+    asyncio.run(run())
+
+
+def test_human_confirmation_never_uses_automatic_dom_password_or_totp(tmp_path):
+    async def run():
+        control,contexts=controller(tmp_path,result="challenge")
+        async def forbidden(*args):raise AssertionError("No automatic DOM credentials")
+        control._try_submit_once=control._try_totp_once=forbidden
+        await control.start()
+        try:
+            await control.save_account("synthetic-user","synthetic-password")
+            await wait_state(control,"needs_attention")
+            assert control._browser_ephemeral and contexts[0].page.url.endswith("/challenge/synthetic/")
+            assert contexts[0].page.fills==[] and contexts[0].page.submits==0
+            assert not (control.settings.profile_dir/"Default").exists()
+            contexts[0].authenticated=True;contexts[0].page.url=HOME_URL
+            await wait_state(control,"ready")
+            assert len(control.api_client.adopted)==1 and len(control.api_client.calls)==1
+        finally:await control.close()
+    asyncio.run(run())
+
+
+def test_challenge_browser_launch_is_ephemeral_scoped_and_uses_api_user_agent(tmp_path,monkeypatch):
+    async def run():
+        context=FakeContext();calls={}
+        class Browser:
+            async def new_context(self,**kwargs):calls["context"]=kwargs;return context
+            async def close(self):
+                assert os.path.isdir(calls["launch"]["env"]["HOME"])
+                calls["browser_closed"]=True
+        class Chromium:
+            async def launch(self,**kwargs):calls["launch"]=kwargs;return Browser()
+            async def launch_persistent_context(self,*args,**kwargs):raise AssertionError("No persistent profile for API challenge")
+        class Playwright:
+            chromium=Chromium()
+            async def stop(self):
+                assert os.path.isdir(calls["launch"]["env"]["HOME"])
+                calls["stopped"]=True
+        class Manager:
+            async def start(self):return Playwright()
+        monkeypatch.setitem(sys.modules,"playwright.async_api",SimpleNamespace(async_playwright=Manager))
+        control=BrowserController(options(tmp_path),api_client=FakeApiClient())
+        control.settings.profile_dir.mkdir(mode=0o700)
+        sentinel=control.settings.profile_dir/"synthetic-original-profile";sentinel.write_bytes(b"retained")
+        monkeypatch.setenv("HOME",str(control.settings.profile_dir))
+        monkeypatch.setenv("XDG_CONFIG_HOME","synthetic-original-config")
+        monkeypatch.setenv("XDG_CACHE_HOME","synthetic-original-cache")
+        try:
+            await control._open_browser(ephemeral=True,user_agent="synthetic-api-agent")
+            assert calls["context"]["user_agent"]=="synthetic-api-agent"
+            assert calls["context"]["service_workers"]=="block" and not calls["context"]["accept_downloads"]
+            assert context.route_handler==control._route and context.ws_handler
+            environment=calls["launch"]["env"]
+            assert environment["HOME"]!=str(control.settings.profile_dir)
+            assert environment["XDG_CONFIG_HOME"]==os.path.join(environment["HOME"],"config")
+            assert environment["XDG_CACHE_HOME"]==os.path.join(environment["HOME"],"cache")
+            if os.name=="posix":
+                assert os.path.dirname(environment["HOME"])=="/tmp"
+                assert stat.S_IMODE(os.stat(environment["HOME"]).st_mode)==0o700
+            assert os.environ["HOME"]==str(control.settings.profile_dir)
+            assert os.environ["XDG_CONFIG_HOME"]=="synthetic-original-config"
+            assert os.environ["XDG_CACHE_HOME"]=="synthetic-original-cache"
+            assert list(control.settings.profile_dir.iterdir())==[sentinel] and sentinel.read_bytes()==b"retained"
+        finally:await control.close()
+        assert calls["browser_closed"] and calls["stopped"]
+        assert not os.path.exists(calls["launch"]["env"]["HOME"])
+        await control.close()  # Reentry cannot remove any unrelated temp directory.
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cancelled",[False,True])
+def test_failed_or_cancelled_ephemeral_launch_cleans_only_its_private_home(tmp_path,monkeypatch,cancelled):
+    async def run():
+        calls={}
+        class Chromium:
+            async def launch(self,**kwargs):
+                calls["home"]=kwargs["env"]["HOME"]
+                assert os.path.isdir(calls["home"])
+                if cancelled:raise asyncio.CancelledError
+                raise RuntimeError("synthetic launch failure")
+        class Playwright:
+            chromium=Chromium()
+            async def stop(self):
+                assert os.path.isdir(calls["home"])
+                calls["stopped"]=True
+        class Manager:
+            async def start(self):return Playwright()
+        monkeypatch.setitem(sys.modules,"playwright.async_api",SimpleNamespace(async_playwright=Manager))
+        control=BrowserController(options(tmp_path),api_client=FakeApiClient())
+        retained=tmp_path/"synthetic-unrelated-temp";retained.write_bytes(b"retain")
+        try:
+            with pytest.raises(asyncio.CancelledError if cancelled else RuntimeError):
+                await control._open_browser(ephemeral=True,user_agent="synthetic-api-agent")
+            assert calls["stopped"] and not os.path.exists(calls["home"])
+            assert control._ephemeral_home is None and control.playwright is None
+            assert retained.read_bytes()==b"retain"
+        finally:await control.close()
+    asyncio.run(run())
+
+
+def test_api_verification_failure_never_publishes_browser_cookie_as_ready(tmp_path):
+    class Unverified(FakeApiClient):
+        def accept_browser_session(self,account,cookies,*,stop_event=None):
+            self.adopted.append(cookies)
+            return api_result("needs_attention")
+    async def run():
+        api=Unverified("challenge");control,contexts=controller(tmp_path,api_client=api)
+        await control.start()
+        try:
+            await control.save_account("synthetic-user","synthetic-password")
+            await wait_state(control,"needs_attention")
+            contexts[0].authenticated=True;contexts[0].page.url=HOME_URL
+            await asyncio.sleep(.05)
+            assert len(api.adopted)==1  # No continuous API polling after a network failure.
+            assert control.state.status()["session_generation"]==0
+            assert not (control.settings.credentials_dir/"instagram.cookies.txt").exists()
+        finally:await control.close()
+    asyncio.run(run())
+
+
+def test_cancelled_api_thread_is_drained_before_session_and_account_deletion(tmp_path):
+    async def run():
+        entered=threading.Event();stopped=threading.Event()
+        control,contexts=controller(tmp_path)
+        class BlockingApi(FakeApiClient):
+            def refresh(self,account,request_id,state,*,stop_event=None):
+                entered.set()
+                assert stop_event.wait(2)
+                control.api_store.save(account["username"],cookies={"csrftoken":"synthetic"},pending_stage="checkpoint")
+                stopped.set()
+                return api_result()
+        control.api_client=BlockingApi()
+        await control.start()
+        try:
+            await control.save_account("synthetic-user","synthetic-password")
+            assert await asyncio.to_thread(entered.wait,1)
+            await control.delete_account()
+            assert stopped.is_set() and contexts==[]
+            assert not control.vault.configured() and control.api_store.load("synthetic-user") is None
+            assert not (control.settings.credentials_dir/"instagram.cookies.txt").exists()
+        finally:await control.close()
+    asyncio.run(run())
+
+
+def test_controller_integrates_real_adapter_and_encrypted_session_store_offline(tmp_path):
+    calls=[]
+    class Context:
+        user_agent="synthetic-api-agent"
+        def __init__(self):self.values={}
+        def save_session(self):return self.values
+    class Loader:
+        def __init__(self,**kwargs):self.context=Context()
+        def login(self,username,password):
+            calls.append("password")
+            self.context.values={"sessionid":"synthetic-session","csrftoken":"synthetic-csrf"}
+        def load_session(self,username,cookies):self.context.values=cookies
+        def test_login(self):calls.append("verify");return "synthetic-user"
+        def close(self):pass
+    async def run():
+        control,contexts=controller(tmp_path)
+        control.api_client=InstagramApiClient(control.api_store,loader_factory=Loader)
+        control.vault.save("synthetic-user","synthetic-password")
+        await control.start()
+        try:
+            await control.login();await wait_state(control,"ready")
+            assert calls==["password","verify"] and contexts==[]
+            stored=control.api_store.load("synthetic-user")
+            assert stored.pending_stage=="ready" and stored.cookies["sessionid"]=="synthetic-session"
+            encrypted=(control.settings.secrets_dir/"instagram.api-session.enc").read_bytes()
+            assert b"synthetic-session" not in encrypted
+            control.state.configure(True)  # Explicitly end the cooldown for this offline reuse check.
+            await control.login();await wait_state(control,"ready")
+            assert calls==["password","verify","verify"] and contexts==[]
+            assert control.state.status()["session_generation"]==2
         finally:await control.close()
     asyncio.run(run())
 
@@ -395,7 +652,7 @@ def test_cancelled_cookie_export_thread_is_drained_before_delete(tmp_path):
     async def run():
         control,contexts=controller(tmp_path,authenticated=True)
         control.vault.save("synthetic-user","synthetic-password");control.state.configure(True);request=control.state.request_refresh()
-        await control._open_browser();control.page.url=HOME_URL
+        await control._open_browser(ephemeral=True,user_agent="synthetic-api-agent");control.page.url=HOME_URL
         entered=threading.Event();release=threading.Event();real_import=control.sessions.import_text
         def slow_import(*args):entered.set();release.wait(2);return real_import(*args)
         control.sessions.import_text=slow_import
@@ -599,6 +856,35 @@ class OTPPage(FakePage):
         if matches_app and role==context.app_method_role and context.picker_open:return OTPNode(self,"app-"+role)
         if name==context.other_method_label and context.allow_picker and not context.picker_open:return OTPNode(self,"other-method")
         return OTPNode(self,"absent",0)
+    def get_by_text(self,text,*,exact):
+        return OTPTitle(self,int(self.context.title_fallback and self.context.picker_open and text=="Authentifizierungs-App" and exact))
+
+
+class OTPTitle(OTPNode):
+    def __init__(self,page,count):super().__init__(page,"title",count)
+    def locator(self,selector):return OTPTitleScope(self.page,selector.count(".."))
+    async def click(self,**kwargs):
+        self.page.context.method_clicks.append("app-title")
+        self.page.context.app_selected=self.page.context.title_selects
+
+
+class OTPTitleChoice(OTPNode):
+    async def get_attribute(self,name):
+        if name=="aria-checked" and self.page.context.title_aria_choice:return "true" if self.page.context.app_selected else "false"
+        return None
+
+
+class OTPTitleScope:
+    def __init__(self,page,depth):self.page,self.depth=page,depth
+    async def count(self):return 1
+    def locator(self,selector):
+        context=self.page.context
+        if selector==AUTHENTICATOR_CHOICE_SELECTOR:return OTPTitleChoice(self.page,"radio",context.title_radio_count if self.depth>=2 else 0)
+        if selector=="xpath=self::body | self::html":return OTPNode(self.page,"body",int(self.depth>=6))
+        if selector in (OTP_INPUT_SELECTOR,LOGIN_PASSWORD_SELECTOR):return OTPNode(self.page,"form-field",int(context.title_has_code))
+        return OTPNode(self.page,"absent",0)
+    def get_by_role(self,role,*,name,exact):
+        return OTPNode(self.page,"picker-forward",int(self.depth>=4 and self.page.context.app_selected and name=="Weiter"))
 
 
 class OTPContext(FakeContext):
@@ -609,6 +895,7 @@ class OTPContext(FakeContext):
         self.picker_open=False;self.allow_picker=False;self.app_selected=False;self.other_method_label="Andere Methode"
         self.app_method_label="Authentifizierungs-App";self.app_method_role="radio";self.pattern_lookups=0
         self.otp_placeholder_only=False
+        self.title_fallback=False;self.title_radio_count=1;self.title_selects=True;self.title_aria_choice=False;self.title_has_code=False
     def otp_selector_count(self,selector):
         if selector!=OTP_INPUT_SELECTOR:return 0
         if self.otp_placeholder_only and 'input[placeholder="Code" i]:visible' not in selector:return 0
@@ -723,6 +1010,48 @@ def test_exact_app_method_title_has_priority_over_description_fallback(tmp_path,
         try:
             assert await control._choose_totp_method(request)
             assert context.method_clicks==["app-radio","picker-forward"] and context.pattern_lookups==0
+        finally:await control.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("aria_choice",[False,True])
+def test_exact_app_title_selects_its_single_unnamed_choice_and_local_continue(tmp_path,monkeypatch,aria_choice):
+    async def run():
+        control,context,request=await otp_controller(tmp_path,monkeypatch)
+        context.otp_text="Code aus WhatsApp eingeben";context.picker_open=True;context.title_fallback=True
+        context.app_method_label="synthetic inaccessible role name";context.title_aria_choice=aria_choice
+        try:
+            assert await control._choose_totp_method(request)
+            assert context.method_clicks==["app-title","picker-forward"]
+            assert context.otp_fills==[] and control.state.totp_attempt_available(request)
+            assert not await control._choose_totp_method(request)
+        finally:await control.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("radio_count",[0,2])
+def test_exact_app_title_without_single_associated_choice_stays_human(tmp_path,monkeypatch,radio_count):
+    async def run():
+        control,context,request=await otp_controller(tmp_path,monkeypatch)
+        context.otp_text="Code aus WhatsApp eingeben";context.picker_open=True;context.title_fallback=True
+        context.app_method_label="synthetic inaccessible role name";context.title_radio_count=radio_count
+        try:
+            assert not await control._choose_totp_method(request)
+            assert context.method_clicks==[] and context.otp_fills==[] and control.state.totp_attempt_available(request)
+        finally:await control.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("has_code,selects",[(True,True),(False,False)])
+def test_title_fallback_rejects_code_form_and_never_continues_unchecked_choice(tmp_path,monkeypatch,has_code,selects):
+    async def run():
+        control,context,request=await otp_controller(tmp_path,monkeypatch)
+        context.otp_text="Code aus WhatsApp eingeben";context.picker_open=True;context.title_fallback=True
+        context.app_method_label="synthetic inaccessible role name";context.title_has_code=has_code;context.title_selects=selects
+        try:
+            assert await control._choose_totp_method(request) is not has_code
+            assert context.method_clicks==([] if has_code else ["app-title"])
+            assert context.otp_fills==[] and control.state.totp_attempt_available(request)
         finally:await control.close()
     asyncio.run(run())
 

@@ -9,6 +9,8 @@ import secrets
 import shutil
 import socket
 import stat
+import threading
+import tempfile
 import time
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
@@ -22,6 +24,8 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .instagram_auth import InstagramAuthState, MESSAGES
+from .instagram_api import InstagramApiClient
+from .instagram_api_store import InstagramApiSessionStore, safe_checkpoint_url
 from .source_sessions import SourceSessionError, SourceSessionStore, validate_cookie_text
 from .totp import TOTPError, fresh_totp, parse_secret
 
@@ -40,6 +44,7 @@ OTP_SUBMIT_LABELS = ("Weiter","Bestätigen","Continue","Confirm")
 OTHER_METHOD_LABELS = ("Andere Methode","Andere Methode nutzen","Andere Methode verwenden","Eine andere Methode verwenden","Andere Methode auswählen","Eine andere Methode auswählen","Andere Methode ausprobieren","Try another way","Try another method","Use another method")
 AUTHENTICATOR_METHOD_LABELS = ("Authentifizierungs-App","Authentifizierungsapp","Authenticator app","Authentication app")
 AUTHENTICATOR_METHOD_DESCRIBED_NAME = re.compile(r"\AAuthentifizierungs-App(?:\s+Du rufst den Code über deine Authentifizierungs-App ab\.)?\Z")
+AUTHENTICATOR_CHOICE_SELECTOR = 'input[type="radio"],[role="radio"],[aria-checked="true"],[aria-checked="false"]'
 AUTHENTICATOR_PROMPTS = ("Öffne deine Authentifizierungs-App","Öffne deine Authentifizierungsapp","Open your authentication app","Open your authenticator app","Code aus deiner Authentifizierungs-App","Code aus der Authentifizierungs-App","code from your authentication app","code from your authenticator app")
 
 
@@ -297,16 +302,23 @@ def cookie_text_from_browser(cookies: list[dict]) -> str:
 
 
 class BrowserController:
-    def __init__(self,settings:BrowserSettings,*,browser_factory=None):
+    def __init__(self,settings:BrowserSettings,*,browser_factory=None,api_client=None):
         self.settings=settings
         self.state=InstagramAuthState(settings.state_dir)
         self.vault=AccountVault(settings.secrets_dir)
+        self.api_store=InstagramApiSessionStore(self.vault,private_directory)
+        self.api_client=api_client or InstagramApiClient(self.api_store)
         self.sessions=SourceSessionStore(settings.credentials_dir)
         self.owner=ProfileOwnerLock(settings.secrets_dir/"browser.lock")
         self.control_lock=asyncio.Lock()
         self.operation_lock=asyncio.Lock()
         self.browser_factory=browser_factory
-        self.context=self.page=self.playwright=None
+        self.context=self.page=self.playwright=self.browser=None
+        self._ephemeral_home=None
+        self._browser_ephemeral=False
+        self.api_stop=None
+        self.login_wakeup=asyncio.Event()
+        self._human_session_checked=False
         self.interaction_id=None
         self.last_activity=0.0
         self.last_account_write=0.0
@@ -342,6 +354,7 @@ class BrowserController:
         self.owner.release()
 
     async def _cancel_login(self):
+        if self.api_stop is not None:self.api_stop.set()
         if self.login_task and not self.login_task.done():
             self.login_task.cancel()
             await asyncio.gather(self.login_task,return_exceptions=True)
@@ -374,36 +387,51 @@ class BrowserController:
             await route.abort()
         else: await route.continue_()
 
-    async def _open_browser(self):
-        if self.page is not None: return
+    async def _open_browser(self,*,ephemeral=False,user_agent=None):
+        if self.page is not None and self._browser_ephemeral==ephemeral:return
         if self.context is not None: await self._close_browser()
         self.last_activity=time.monotonic()
         # Direct operator/fake entry points obey the same single-owner rule as start().
         with private_directory(self.settings.secrets_dir):pass
         self.owner.acquire()
-        with private_directory(self.settings.profile_dir): pass
-        self._clear_stale_singletons()
-        # Disable password saving in this dedicated profile; the account is kept in AES-GCM only.
-        default=self.settings.profile_dir/"Default"
-        if default.is_symlink(): raise AccountStorageError()
-        default.mkdir(mode=0o700,exist_ok=True)
-        preferences=default/"Preferences"
-        if preferences.is_symlink(): raise AccountStorageError()
-        try: content=json.loads(preferences.read_text()) if preferences.exists() else {}
-        except (ValueError,OSError): content={}
-        content["credentials_enable_service"]=False
-        content.setdefault("profile",{})["password_manager_enabled"]=False
-        preferences.write_text(json.dumps(content))
-        preferences.chmod(0o600)
+        if not ephemeral:
+            with private_directory(self.settings.profile_dir): pass
+            self._clear_stale_singletons()
+            # The legacy operator preview alone may open the dedicated profile.
+            default=self.settings.profile_dir/"Default"
+            if default.is_symlink(): raise AccountStorageError()
+            default.mkdir(mode=0o700,exist_ok=True)
+            preferences=default/"Preferences"
+            if preferences.is_symlink(): raise AccountStorageError()
+            try: content=json.loads(preferences.read_text()) if preferences.exists() else {}
+            except (ValueError,OSError): content={}
+            content["credentials_enable_service"]=False
+            content.setdefault("profile",{})["password_manager_enabled"]=False
+            preferences.write_text(json.dumps(content))
+            preferences.chmod(0o600)
+        self._browser_ephemeral=ephemeral
         if self.browser_factory:
             self.context=await self.browser_factory(self.settings)
         else:
             from playwright.async_api import async_playwright
             self.playwright=await async_playwright().start()
-            self.context=await self.playwright.chromium.launch_persistent_context(
-                str(self.settings.profile_dir),executable_path=self.settings.executable,headless=True,
-                chromium_sandbox=False,viewport=VIEWPORT,accept_downloads=False,service_workers="block",
-                permissions=[],locale="de-DE",args=["--disable-background-networking","--disable-component-update","--disable-sync","--no-first-run","--disable-save-password-bubble","--disk-cache-size=67108864","--media-cache-size=1048576"])
+            launch=dict(executable_path=self.settings.executable,headless=True,chromium_sandbox=False,
+                args=["--disable-background-networking","--disable-component-update","--disable-sync","--no-first-run","--disable-save-password-bubble","--disk-cache-size=67108864","--media-cache-size=1048576"])
+            context_options=dict(viewport=VIEWPORT,accept_downloads=False,service_workers="block",permissions=[],locale="de-DE")
+            if ephemeral:
+                try:
+                    self._ephemeral_home=tempfile.TemporaryDirectory(prefix="vela-challenge-",dir="/tmp" if os.name=="posix" else None)
+                    temporary_home=Path(self._ephemeral_home.name)
+                    temporary_home.chmod(0o700)
+                    for child in ("config","cache"):(temporary_home/child).mkdir(mode=0o700)
+                    launch["env"]={**os.environ,"HOME":str(temporary_home),"XDG_CONFIG_HOME":str(temporary_home/"config"),"XDG_CACHE_HOME":str(temporary_home/"cache")}
+                    self.browser=await self.playwright.chromium.launch(**launch)
+                    self.context=await self.browser.new_context(**context_options,user_agent=user_agent)
+                except BaseException:
+                    await self._close_browser()
+                    raise
+            else:
+                self.context=await self.playwright.chromium.launch_persistent_context(str(self.settings.profile_dir),**launch,**context_options)
         await self.context.route("**/*",self._route)
         if hasattr(self.context,"route_web_socket"):
             await self.context.route_web_socket("**/*",lambda route:route.close())
@@ -483,9 +511,16 @@ class BrowserController:
         self.interaction_id=None
         if context:
             with suppress(Exception): await asyncio.wait_for(context.close(),15)
+        if self.browser:
+            with suppress(Exception):await asyncio.wait_for(self.browser.close(),15)
+            self.browser=None
+        self._browser_ephemeral=False
         if self.playwright:
             with suppress(Exception): await self.playwright.stop()
             self.playwright=None
+        if self._ephemeral_home is not None:
+            temporary_home,self._ephemeral_home=self._ephemeral_home,None
+            await drain_thread(temporary_home.cleanup)
         self.state.publish(browser_available=False,interaction_id=None)
 
     def _clear_profile(self):
@@ -509,6 +544,7 @@ class BrowserController:
             async with self.control_lock:
                 await self._close_browser()
                 await drain_thread(self.sessions.delete,"instagram")
+                await drain_thread(self.api_store.clear)
                 await drain_thread(self._clear_profile)
                 await drain_thread(self.vault.save,username,password)
                 self.state.configure(True)
@@ -523,6 +559,7 @@ class BrowserController:
             async with self.control_lock:
                 await self._close_browser()
                 await drain_thread(self.sessions.delete,"instagram")
+                await drain_thread(self.api_store.clear)
                 await drain_thread(self._clear_profile)
                 await drain_thread(self.vault.delete)
                 self.state.configure(False)
@@ -534,6 +571,7 @@ class BrowserController:
                 raise BrowserControlError("Bitte zuerst den Instagram-Zugang speichern.",409)
             if not self.state.request_refresh(force=True):
                 raise BrowserControlError("Bitte kurz warten, bevor die Anmeldung erneut gestartet wird.",429)
+            self.login_wakeup.set()
         return self.state.status()
 
     async def set_totp(self,secret:str):
@@ -561,10 +599,21 @@ class BrowserController:
         return bool(await marker.count())
 
     async def _export_ready(self,request_id):
-        if not await self._authenticated(): return False
-        text=cookie_text_from_browser(await self.context.cookies())
+        if not self._browser_ephemeral or self._human_session_checked or not await self._authenticated():return False
+        self._human_session_checked=True
+        account=await drain_thread(self.vault.load)
+        result=await drain_thread(self.api_client.accept_browser_session,account,await self.context.cookies(),stop_event=self.api_stop)
+        if result.state!="ready":return False
+        return await self._complete_api_ready(request_id,result)
+
+    async def _complete_api_ready(self,request_id,result):
+        current=self.state.status()
+        if not current["configured"] or current["request_id"]!=request_id or current["completed_request_id"]>=request_id:return False
+        # The adapter's identity check is necessary but the shared domain/expiry
+        # validator remains the final boundary before publishing a download jar.
+        text=cookie_text_from_browser(result.cookies)
         await drain_thread(self.sessions.import_text,"instagram",text)
-        self.state.finish(request_id,"ready",browser_available=True,interaction_id=self.interaction_id)
+        self.state.finish(request_id,"ready",browser_available=self.page is not None,interaction_id=self.interaction_id)
         self.last_activity=time.monotonic()
         return True
 
@@ -642,6 +691,45 @@ class BrowserController:
             if len(submits)==1:return otp,submits[0]
         return None
 
+    async def _choose_totp_title(self,request_id):
+        title=self.page.get_by_text("Authentifizierungs-App",exact=True)
+        if await title.count()!=1 or not await title.is_visible():return False
+        scopes=[title.locator("xpath="+"/".join([".."]*depth)) for depth in range(1,7)]
+        choice=None
+        for scope in scopes:
+            if await scope.count()!=1:continue
+            if await scope.locator("xpath=self::body | self::html").count():continue
+            if await scope.locator(OTP_INPUT_SELECTOR).count() or await scope.locator(LOGIN_PASSWORD_SELECTOR).count():continue
+            choices=scope.locator(AUTHENTICATOR_CHOICE_SELECTOR)
+            number=await choices.count()
+            if number>1:return False
+            if number==1:
+                choice=choices
+                break
+        if choice is None:return False
+        # The smallest local option proves title/radio association. A failed or
+        # unchecked selection remains human work; never try another option.
+        self._totp_method_selected_request=request_id
+        await title.click(timeout=3000)
+        checked=False
+        with suppress(Exception):checked=await choice.get_attribute("aria-checked")=="true"
+        if not checked:
+            with suppress(Exception):checked=await choice.is_checked()
+        if not checked:return True
+        for picker in scopes:
+            if await picker.count()!=1:continue
+            if await picker.locator("xpath=self::body | self::html").count():continue
+            if await picker.locator(OTP_INPUT_SELECTOR).count() or await picker.locator(LOGIN_PASSWORD_SELECTOR).count():continue
+            if not await picker.locator(AUTHENTICATOR_CHOICE_SELECTOR).count():continue
+            forwards=[]
+            for label in ("Weiter","Continue"):
+                forward=picker.get_by_role("button",name=label,exact=True)
+                if await forward.count()==1 and await forward.is_visible():forwards.append(forward)
+            if len(forwards)==1:
+                await forwards[0].click(timeout=3000)
+                break
+        return True
+
     async def _choose_totp_method(self,request_id):
         if not self._is_two_factor_page() or self._totp_method_selected_request==request_id:return False
         method_names=[(label,True) for label in AUTHENTICATOR_METHOD_LABELS]+[(AUTHENTICATOR_METHOD_DESCRIBED_NAME,False)]
@@ -666,6 +754,7 @@ class BrowserController:
                                         await forwards[0].click(timeout=3000)
                                         break
                     return True
+        if await self._choose_totp_title(request_id):return True
         if self._totp_picker_requested_request==request_id:return False
         for label in OTHER_METHOD_LABELS:
             button=self.page.get_by_role("button",name=label,exact=True)
@@ -695,30 +784,43 @@ class BrowserController:
         finally:del code
 
     async def _run_login(self,request_id):
+        stop_event=threading.Event()
+        self.api_stop=stop_event
+        self.login_wakeup.clear()
+        self._human_session_checked=False
         try:
-            async with self.control_lock:
-                current=self.state.status()
-                if not current["configured"] or current["request_id"]!=request_id or current["completed_request_id"]>=request_id:return
-                await self._open_browser()
-                await self.page.goto(HOME_URL,wait_until="domcontentloaded",timeout=30000)
-                if await self._export_ready(request_id): return
-                await self.page.goto(LOGIN_URL,wait_until="domcontentloaded",timeout=30000)
-            automatic_deadline=time.monotonic()+self.settings.login_timeout
-            attempted=False
-            while time.monotonic()<automatic_deadline:
-                async with self.control_lock:
-                    if await self._export_ready(request_id):return
-                    if not attempted:
-                        with suppress(Exception): attempted=await self._try_submit_once(request_id)
-                    with suppress(Exception):await self._try_totp_once(request_id)
-                await asyncio.sleep(min(1,self.settings.poll_interval))
-            self.state.finish(request_id,"needs_attention",browser_available=True,interaction_id=self.interaction_id)
+            current=self.state.status()
+            if not current["configured"] or current["request_id"]!=request_id or current["completed_request_id"]>=request_id:return
+            async with self.control_lock:await self._close_browser()
+            result=await self._refresh_api(request_id,stop_event)
             deadline=time.monotonic()+self.settings.challenge_timeout
-            while time.monotonic()<deadline:
+            while True:
+                if result.state=="ready":
+                    await self._complete_api_ready(request_id,result)
+                    return
+                if result.state!="needs_attention":
+                    self.state.finish(request_id,"error")
+                    return
                 async with self.control_lock:
-                    if await self._export_ready(request_id):return
-                    with suppress(Exception):await self._try_totp_once(request_id)
-                await asyncio.sleep(min(1,self.settings.poll_interval))
+                    challenge_url=safe_checkpoint_url(result.checkpoint_url)
+                    if challenge_url and self.page is None:
+                        await self._open_browser(ephemeral=True,user_agent=result.user_agent)
+                        if result.cookies:await self.context.add_cookies(result.cookies)
+                        await self.page.goto(challenge_url,wait_until="domcontentloaded",timeout=30000)
+                    self.state.finish(request_id,"needs_attention",browser_available=self.page is not None,interaction_id=self.interaction_id,
+                        message=None if self.page is not None else "Bitte die Anmeldung direkt in Instagram bestätigen und anschließend in Vela erneut anmelden.")
+                while time.monotonic()<deadline:
+                    current=self.state.status()
+                    if current["request_id"]!=request_id or current["completed_request_id"]>=request_id:return
+                    async with self.control_lock:
+                        if await self._export_ready(request_id):return
+                    if self.login_wakeup.is_set():
+                        self.login_wakeup.clear()
+                        self._human_session_checked=False
+                        result=await self._refresh_api(request_id,stop_event)
+                        break
+                    await asyncio.sleep(min(1,self.settings.poll_interval))
+                else:break
             async with self.control_lock: await self._close_browser()
             self.state.finish(request_id,"error",message="Die Bestätigungszeit ist abgelaufen. Bitte die Anmeldung erneut öffnen.")
         except asyncio.CancelledError:
@@ -726,6 +828,16 @@ class BrowserController:
         except Exception:
             async with self.control_lock: await self._close_browser()
             self.state.finish(request_id,"error")
+        finally:
+            stop_event.set()
+            if self.api_stop is stop_event:self.api_stop=None
+
+    async def _refresh_api(self,request_id,stop_event):
+        # TOTP/account mutations share this lock; a manual continuation always
+        # reloads the current vault instead of retaining a removed setup key.
+        async with self.control_lock:
+            account=await drain_thread(self.vault.load)
+            return await drain_thread(self.api_client.refresh,account,request_id,self.state,stop_event=stop_event)
 
     async def open_login_preview(self):
         """Operator smoke test: open the login page without reading or submitting an account."""
