@@ -32,6 +32,7 @@ PASSWORD_SELECTOR = 'input[type="password"],input[name="pass" i],input[name*="pa
 USERNAME_SELECTOR = 'input[name="username"]:visible,input[name="email"]:visible,input[autocomplete="username"]:visible,input[type="email"]:visible'
 LOGIN_PASSWORD_SELECTOR = 'input[name="password"]:visible,input[name="pass"]:visible,input[type="password"]:visible'
 SUBMIT_SELECTOR = 'button[type="submit"]:visible,input[type="submit"]:visible'
+LOGIN_SUBMIT_LABELS = ("Anmelden","Log in","Log In","Einloggen")
 
 
 class BrowserControlError(ValueError):
@@ -521,13 +522,34 @@ class BrowserController:
         await self._decline_optional_cookies()
         username=self.page.locator(USERNAME_SELECTOR).first
         password=self.page.locator(LOGIN_PASSWORD_SELECTOR).first
-        if not await username.is_visible() or not await password.is_visible(): return False
+        if not await username.is_visible() or not await password.is_visible():
+            # A persisted profile can show an account chooser instead of input
+            # fields. Open the explicit alternate-account form; never continue
+            # a remembered identity or remove browser profiles implicitly.
+            for label in ("Anderes Profil verwenden","Anderes Konto verwenden","Mit einem anderen Konto anmelden",
+                          "Use another profile","Use another account","Log into another account"):
+                button=self.page.get_by_role("button",name=label,exact=True)
+                if await button.is_visible():
+                    await button.click(timeout=3000)
+                    break
+            return False  # Recheck the rendered form in the bounded outer loop.
+        submit=self.page.locator(SUBMIT_SELECTOR).first
+        if not await submit.is_visible():
+            submit=None
+            for label in LOGIN_SUBMIT_LABELS:
+                button=self.page.get_by_role("button",name=label,exact=True)
+                if await button.is_visible():
+                    submit=button
+                    break
+            if submit is None:return False
+        # The real login action may be an aria-disabled DIV until both fields
+        # are filled. Verify presence now; click waits for enabled state later.
         if not self.state.consume_login_attempt(request_id): return False
         account=await drain_thread(self.vault.load)
         await username.fill(account["username"])
         await password.fill(account["password"])
         del account
-        await self.page.locator(SUBMIT_SELECTOR).first.click(timeout=5000)
+        await submit.click(timeout=5000)
         return True
 
     async def _decline_optional_cookies(self):

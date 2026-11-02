@@ -33,11 +33,19 @@ class FakeLocator:
     def first(self):return self
     async def is_visible(self):
         if self.selector=="Decline optional cookies":return self.page.context.overlay
-        if self.selector in (USERNAME_SELECTOR,LOGIN_PASSWORD_SELECTOR):return self.page.url==LOGIN_URL
+        if self.selector in (USERNAME_SELECTOR,LOGIN_PASSWORD_SELECTOR):return self.page.url==LOGIN_URL and (not self.page.context.chooser or self.page.context.form_also_visible)
+        if self.selector==SUBMIT_SELECTOR:return self.page.url==LOGIN_URL and self.page.context.native_submit
+        if self.selector==self.page.context.role_submit_label:return self.page.url==LOGIN_URL
+        if self.selector==self.page.context.chooser_label:return self.page.context.chooser
         return False
+    async def is_enabled(self):return not self.page.context.submit_disabled_until_fill or len(self.page.fills)>=2
     async def fill(self,value):self.page.fills.append((self.selector,value))
     async def click(self,**kwargs):
+        self.page.clicked_controls.append(self.selector)
         if self.selector=="Decline optional cookies":self.page.context.overlay=False;return
+        if self.selector==self.page.context.chooser_label:
+            self.page.context.chooser=False;self.page.context.chooser_clicks+=1;return
+        if not await self.is_enabled():raise TimeoutError("Synthetic login control still disabled")
         self.page.submits+=1
         if self.page.context.result=="ready":self.page.context.authenticated=True;self.page.url=HOME_URL
         else:self.page.url="https://www.instagram.com/challenge/synthetic/"
@@ -59,6 +67,7 @@ class FakeMouse:
 class FakePage:
     def __init__(self,context):
         self.context=context;self.url="about:blank";self.fills=[];self.submits=0;self.events={};self.frames=[self]
+        self.clicked_controls=[]
         self.keyboard=FakeKeyboard(self);self.mouse=FakeMouse(self);self.screenshot_options=None;self.closed=False
     def set_default_timeout(self,value):pass
     def set_default_navigation_timeout(self,value):pass
@@ -75,6 +84,8 @@ class FakePage:
 class FakeContext:
     def __init__(self,result="ready",authenticated=False):
         self.result=result;self.authenticated=authenticated;self.overlay=True;self.pages=[];self.events={};self.closed=False
+        self.chooser=False;self.chooser_label="Anderes Profil verwenden";self.chooser_clicks=0;self.form_also_visible=False
+        self.native_submit=True;self.role_submit_label=None;self.submit_disabled_until_fill=False
     async def route(self,pattern,handler):self.route_handler=handler
     async def route_web_socket(self,pattern,handler):self.ws_handler=handler
     def on(self,name,handler):self.events[name]=handler
@@ -240,6 +251,107 @@ def test_restart_never_repeats_consumed_automatic_password_attempt(tmp_path):
         try:
             await wait_state(control,"needs_attention")
             assert contexts[0].page.submits==0 and contexts[0].page.fills==[]
+        finally:await control.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("label",["Anderes Profil verwenden","Anderes Konto verwenden","Mit einem anderen Konto anmelden","Use another profile","Use another account","Log into another account"])
+def test_profile_chooser_opens_form_without_consuming_login_budget(tmp_path,label):
+    async def run():
+        control,contexts=controller(tmp_path)
+        control.vault.save("synthetic-user","synthetic-password")
+        control.state.configure(True);request=control.state.request_refresh()
+        try:
+            await control._open_browser();control.page.url=LOGIN_URL
+            context=contexts[0];context.chooser=True;context.chooser_label=label
+            assert not await control._try_submit_once(request)
+            assert context.chooser_clicks==1 and context.page.fills==[] and context.page.submits==0
+            with control.state._database.connection() as connection:
+                assert connection.execute("SELECT login_attempted FROM instagram_auth WHERE id=1").fetchone()[0]==0
+            assert await control._try_submit_once(request)
+            assert context.page.submits==1 and len(context.page.fills)==2
+            assert not await control._try_submit_once(request)
+            assert context.page.submits==1
+        finally:await control.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("label",["Weiter","Profile aus diesem Browser entfernen"])
+def test_profile_chooser_never_continues_or_removes_a_remembered_profile(tmp_path,label):
+    async def run():
+        control,contexts=controller(tmp_path)
+        control.state.configure(True);request=control.state.request_refresh()
+        try:
+            await control._open_browser();control.page.url=LOGIN_URL
+            contexts[0].chooser=True;contexts[0].chooser_label=label
+            assert not await control._try_submit_once(request)
+            assert contexts[0].chooser_clicks==0 and contexts[0].page.submits==0
+            with control.state._database.connection() as connection:
+                assert connection.execute("SELECT login_attempted FROM instagram_auth WHERE id=1").fetchone()[0]==0
+        finally:await control.close()
+    asyncio.run(run())
+
+
+def test_existing_form_is_used_without_touching_an_alternate_profile_button(tmp_path):
+    async def run():
+        control,contexts=controller(tmp_path)
+        control.vault.save("synthetic-user","synthetic-password")
+        control.state.configure(True);request=control.state.request_refresh()
+        try:
+            await control._open_browser();control.page.url=LOGIN_URL
+            contexts[0].chooser=True;contexts[0].form_also_visible=True
+            assert await control._try_submit_once(request)
+            assert contexts[0].chooser_clicks==0 and contexts[0].page.submits==1
+        finally:await control.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("label",["Anmelden","Log in","Log In","Einloggen"])
+def test_exact_role_submit_is_found_before_budget_and_can_enable_after_fill(tmp_path,label):
+    async def run():
+        control,contexts=controller(tmp_path)
+        control.vault.save("synthetic-user","synthetic-password")
+        control.state.configure(True);request=control.state.request_refresh()
+        try:
+            await control._open_browser();control.page.url=LOGIN_URL
+            context=contexts[0];context.native_submit=False;context.role_submit_label=label;context.submit_disabled_until_fill=True
+            assert await control.page.get_by_role("button",name=label,exact=True).is_visible()
+            assert not await control.page.get_by_role("button",name=label,exact=True).is_enabled()
+            assert await control._try_submit_once(request)
+            assert context.page.submits==1 and context.page.clicked_controls[-1]==label
+            assert len(context.page.fills)==2
+        finally:await control.close()
+    asyncio.run(run())
+
+
+def test_native_submit_is_preferred_when_native_and_role_controls_are_present(tmp_path):
+    async def run():
+        control,contexts=controller(tmp_path)
+        control.vault.save("synthetic-user","synthetic-password")
+        control.state.configure(True);request=control.state.request_refresh()
+        try:
+            await control._open_browser();control.page.url=LOGIN_URL
+            contexts[0].role_submit_label="Anmelden"
+            assert await control._try_submit_once(request)
+            assert contexts[0].page.clicked_controls[-1]==SUBMIT_SELECTOR
+            assert "Anmelden" not in contexts[0].page.clicked_controls
+        finally:await control.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("other_control",[None,"Mit Facebook anmelden","Weiter"])
+def test_absent_submit_or_other_login_provider_never_spends_password_budget(tmp_path,other_control):
+    async def run():
+        control,contexts=controller(tmp_path)
+        control.state.configure(True);request=control.state.request_refresh()
+        try:
+            await control._open_browser();control.page.url=LOGIN_URL
+            context=contexts[0];context.native_submit=False;context.role_submit_label=other_control
+            assert not await control._try_submit_once(request)
+            assert context.page.fills==[] and context.page.submits==0
+            assert other_control not in context.page.clicked_controls
+            with control.state._database.connection() as connection:
+                assert connection.execute("SELECT login_attempted FROM instagram_auth WHERE id=1").fetchone()[0]==0
         finally:await control.close()
     asyncio.run(run())
 
