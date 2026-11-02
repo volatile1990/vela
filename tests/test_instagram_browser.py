@@ -570,6 +570,7 @@ class OTPNode:
         context.method_clicks.append(self.kind)
         if self.kind=="other-method":context.picker_open=True
         elif self.kind=="app-radio":context.app_selected=True
+        elif self.kind=="app-button":context.app_selected=True;context.picker_open=False;context.otp_text="Öffne deine Authentifizierungs-App"
         elif self.kind=="picker-forward":context.picker_open=False;context.otp_text="Öffne deine Authentifizierungs-App"
         elif self.kind=="otp-submit":context.otp_submits+=1
 
@@ -578,7 +579,7 @@ class OTPScope:
     def __init__(self,page,picker=False):self.page,self.picker=page,picker
     async def count(self):return 1
     def locator(self,selector):
-        count=0 if self.picker or selector!=OTP_INPUT_SELECTOR else self.page.context.otp_count
+        count=0 if self.picker else self.page.context.otp_selector_count(selector)
         return OTPNode(self.page,"input",count)
     def get_by_text(self,pattern,**kwargs):return OTPNode(self.page,"text",int(bool(pattern.search(self.page.context.otp_text))))
     def get_by_role(self,role,*,name,exact):
@@ -589,12 +590,14 @@ class OTPScope:
 
 class OTPPage(FakePage):
     def locator(self,selector):
-        if selector==OTP_INPUT_SELECTOR:return OTPNode(self,"input",self.context.otp_count)
+        if selector==OTP_INPUT_SELECTOR:return OTPNode(self,"input",self.context.otp_selector_count(selector))
         return super().locator(selector)
     def get_by_role(self,role,*,name,exact):
         context=self.context
-        if name=="Authentifizierungs-App" and role=="radio" and context.picker_open:return OTPNode(self,"app-radio")
-        if name=="Andere Methode" and context.allow_picker and not context.picker_open:return OTPNode(self,"other-method")
+        if hasattr(name,"fullmatch"):context.pattern_lookups+=1
+        matches_app=bool(name.fullmatch(context.app_method_label)) if hasattr(name,"fullmatch") else name==context.app_method_label
+        if matches_app and role==context.app_method_role and context.picker_open:return OTPNode(self,"app-"+role)
+        if name==context.other_method_label and context.allow_picker and not context.picker_open:return OTPNode(self,"other-method")
         return OTPNode(self,"absent",0)
 
 
@@ -603,7 +606,13 @@ class OTPContext(FakeContext):
         super().__init__()
         self.otp_text="Öffne deine Authentifizierungs-App";self.otp_count=1
         self.otp_value="999999";self.otp_fills=[];self.otp_submits=0;self.method_clicks=[]
-        self.picker_open=False;self.allow_picker=False;self.app_selected=False
+        self.picker_open=False;self.allow_picker=False;self.app_selected=False;self.other_method_label="Andere Methode"
+        self.app_method_label="Authentifizierungs-App";self.app_method_role="radio";self.pattern_lookups=0
+        self.otp_placeholder_only=False
+    def otp_selector_count(self,selector):
+        if selector!=OTP_INPUT_SELECTOR:return 0
+        if self.otp_placeholder_only and 'input[placeholder="Code" i]:visible' not in selector:return 0
+        return self.otp_count
     async def new_page(self):self.page=OTPPage(self);self.pages.append(self.page);return self.page
 
 
@@ -648,10 +657,27 @@ def test_whatsapp_and_ambiguous_mixed_forms_never_receive_totp(tmp_path,monkeypa
     asyncio.run(run())
 
 
-def test_otp_method_picker_chooses_only_app_radio_and_its_own_continue(tmp_path,monkeypatch):
+@pytest.mark.parametrize("app_prompt",[True,False])
+def test_placeholder_only_code_field_requires_explicit_authenticator_form(tmp_path,monkeypatch,app_prompt):
     async def run():
         control,context,request=await otp_controller(tmp_path,monkeypatch)
-        context.otp_text="Code aus WhatsApp eingeben";context.allow_picker=True
+        # This field has only placeholder=Code, without name/autocomplete/inputmode.
+        context.otp_placeholder_only=True
+        context.otp_text="Öffne deine Authentifizierungs-App" if app_prompt else "Code aus WhatsApp eingeben"
+        try:
+            assert await control._try_totp_once(request) is app_prompt
+            assert context.otp_fills==(["123456"] if app_prompt else [])
+            assert context.otp_submits==int(app_prompt)
+            assert control.state.totp_attempt_available(request) is not app_prompt
+        finally:await control.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("other_method_label",["Andere Methode","Andere Methode nutzen"])
+def test_otp_method_picker_chooses_only_app_radio_and_its_own_continue(tmp_path,monkeypatch,other_method_label):
+    async def run():
+        control,context,request=await otp_controller(tmp_path,monkeypatch)
+        context.otp_text="Code aus WhatsApp eingeben";context.allow_picker=True;context.other_method_label=other_method_label
         try:
             assert not await control._try_totp_once(request)
             assert context.method_clicks==["other-method"] and control.state.totp_attempt_available(request)
@@ -660,6 +686,43 @@ def test_otp_method_picker_chooses_only_app_radio_and_its_own_continue(tmp_path,
             assert context.otp_fills==[] and control.state.totp_attempt_available(request)
             assert await control._try_totp_once(request)
             assert context.otp_submits==1
+        finally:await control.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("role",["radio","button"])
+def test_app_method_accepts_only_the_complete_observed_description(tmp_path,monkeypatch,role):
+    async def run():
+        control,context,request=await otp_controller(tmp_path,monkeypatch)
+        context.otp_text="Code aus WhatsApp eingeben";context.picker_open=True
+        context.app_method_label="Authentifizierungs-App Du rufst den Code über deine Authentifizierungs-App ab.";context.app_method_role=role
+        try:
+            assert await control._choose_totp_method(request)
+            assert context.method_clicks==(["app-radio","picker-forward"] if role=="radio" else ["app-button"])
+            assert context.pattern_lookups>0 and context.otp_fills==[] and control.state.totp_attempt_available(request)
+        finally:await control.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("name",["Authentifizierungs-App synthetic suffix","Authentifizierungs-App Du rufst den Code über deine Authentifizierungs-App ab. synthetic suffix","synthetic prefix Authentifizierungs-App Du rufst den Code über deine Authentifizierungs-App ab."])
+def test_app_method_rejects_unobserved_accessible_name_suffixes(tmp_path,monkeypatch,name):
+    async def run():
+        control,context,request=await otp_controller(tmp_path,monkeypatch)
+        context.otp_text="Code aus WhatsApp eingeben";context.picker_open=True;context.app_method_label=name
+        try:
+            assert not await control._choose_totp_method(request)
+            assert context.method_clicks==[] and context.otp_fills==[] and control.state.totp_attempt_available(request)
+        finally:await control.close()
+    asyncio.run(run())
+
+
+def test_exact_app_method_title_has_priority_over_description_fallback(tmp_path,monkeypatch):
+    async def run():
+        control,context,request=await otp_controller(tmp_path,monkeypatch)
+        context.otp_text="Code aus WhatsApp eingeben";context.picker_open=True
+        try:
+            assert await control._choose_totp_method(request)
+            assert context.method_clicks==["app-radio","picker-forward"] and context.pattern_lookups==0
         finally:await control.close()
     asyncio.run(run())
 

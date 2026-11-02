@@ -35,10 +35,11 @@ USERNAME_SELECTOR = 'input[name="username"]:visible,input[name="email"]:visible,
 LOGIN_PASSWORD_SELECTOR = 'input[name="password"]:visible,input[name="pass"]:visible,input[type="password"]:visible'
 SUBMIT_SELECTOR = 'button[type="submit"]:visible,input[type="submit"]:visible'
 LOGIN_SUBMIT_LABELS = ("Anmelden","Log in","Log In","Einloggen")
-OTP_INPUT_SELECTOR = 'input[name="approvals_code"]:visible,input[name="security_code"]:visible,input[name="verificationCode"]:visible,input[name="verification_code"]:visible,input[name="two_factor_code"]:visible,input[autocomplete="one-time-code"]:visible,input[inputmode="numeric"][maxlength="6"]:visible'
+OTP_INPUT_SELECTOR = 'input[name="approvals_code"]:visible,input[name="security_code"]:visible,input[name="verificationCode"]:visible,input[name="verification_code"]:visible,input[name="two_factor_code"]:visible,input[autocomplete="one-time-code"]:visible,input[inputmode="numeric"][maxlength="6"]:visible,input[placeholder="Code" i]:visible'
 OTP_SUBMIT_LABELS = ("Weiter","Bestätigen","Continue","Confirm")
-OTHER_METHOD_LABELS = ("Andere Methode","Andere Methode verwenden","Eine andere Methode verwenden","Andere Methode auswählen","Eine andere Methode auswählen","Andere Methode ausprobieren","Try another way","Try another method","Use another method")
+OTHER_METHOD_LABELS = ("Andere Methode","Andere Methode nutzen","Andere Methode verwenden","Eine andere Methode verwenden","Andere Methode auswählen","Eine andere Methode auswählen","Andere Methode ausprobieren","Try another way","Try another method","Use another method")
 AUTHENTICATOR_METHOD_LABELS = ("Authentifizierungs-App","Authentifizierungsapp","Authenticator app","Authentication app")
+AUTHENTICATOR_METHOD_DESCRIBED_NAME = re.compile(r"\AAuthentifizierungs-App(?:\s+Du rufst den Code über deine Authentifizierungs-App ab\.)?\Z")
 AUTHENTICATOR_PROMPTS = ("Öffne deine Authentifizierungs-App","Öffne deine Authentifizierungsapp","Open your authentication app","Open your authenticator app","Code aus deiner Authentifizierungs-App","Code aus der Authentifizierungs-App","code from your authentication app","code from your authenticator app")
 
 
@@ -643,9 +644,10 @@ class BrowserController:
 
     async def _choose_totp_method(self,request_id):
         if not self._is_two_factor_page() or self._totp_method_selected_request==request_id:return False
-        for label in AUTHENTICATOR_METHOD_LABELS:
+        method_names=[(label,True) for label in AUTHENTICATOR_METHOD_LABELS]+[(AUTHENTICATOR_METHOD_DESCRIBED_NAME,False)]
+        for label,exact in method_names:
             for role in ("radio","button"):
-                choice=self.page.get_by_role(role,name=label,exact=True)
+                choice=self.page.get_by_role(role,name=label,exact=exact)
                 if await choice.count()==1 and await choice.is_visible():
                     await choice.click(timeout=3000)
                     self._totp_method_selected_request=request_id
