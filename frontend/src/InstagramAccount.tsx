@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, FormEvent, MouseEvent } from 'react';
-import { Api } from './api';
+import { Api, ApiError } from './api';
 import type { InstagramAccountStatus, InstagramAction } from './api';
 import { Icon } from './icons';
 import { readTotpQr } from './totpQr';
@@ -11,6 +11,15 @@ const stateLabels: Record<InstagramAccountStatus['state'], string> = {
 };
 const keys = [{ key: 'Enter', label: 'Enter' }, { key: 'Tab', label: 'Tab' }, { key: 'Backspace', label: 'Löschen' },
   { key: 'ArrowLeft', label: '←' }, { key: 'ArrowUp', label: '↑' }, { key: 'ArrowDown', label: '↓' }, { key: 'ArrowRight', label: '→' }];
+
+function qrSaveError(cause: unknown): string {
+  if (cause instanceof ApiError) {
+    if (cause.status === 422) return 'Das QR-Bild wurde gelesen, aber der Eintrag wurde abgelehnt. Exportiere genau einen Instagram-Eintrag aus Google Authenticator oder verwende den Instagram-Einrichtungsschlüssel.';
+    if (cause.status === 503) return 'Der QR-Code wurde gelesen. Der Instagram-Dienst ist vorübergehend nicht verfügbar. Versuche den Import später erneut.';
+    if (cause.status === 0) return 'Der QR-Code wurde gelesen. Vela ist nicht erreichbar. Prüfe die Verbindung und versuche den Import erneut.';
+  }
+  return 'Der QR-Code wurde gelesen, aber das Speichern bei Vela konnte nicht bestätigt werden. Aktualisiere den Status und versuche es erneut.';
+}
 
 export default function InstagramAccount({ api, onSessionChange }: { api: Api; onSessionChange?: () => void }) {
   const [account, setAccount] = useState<InstagramAccountStatus | null>(null);
@@ -116,12 +125,17 @@ export default function InstagramAccount({ api, onSessionChange }: { api: Api; o
     if (!file || pending.current || !account?.configured) return;
     pending.current = true; operation.current++; setTotpBusy('scan'); setTotpSecret(''); setError(''); setTotpMessage('');
     try {
-      const secret = await readTotpQr(file);
+      let secret: string;
+      try { secret = await readTotpQr(file); }
+      catch {
+        if (mounted.current) setError('Das QR-Bild konnte im Browser nicht gelesen werden. Wähle ein klares PNG-, JPEG- oder WebP-Bild bis 5 MiB und 16 Megapixel mit einem unterstützten Authenticator-QR-Code.');
+        return;
+      }
       if (!mounted.current) return;
-      const next = await api.saveInstagramTotp(secret);
-      if (mounted.current) { setAccount(next); setTotpMessage('Der Einrichtungsschlüssel aus dem QR-Bild wurde hinterlegt. Es wurde keine neue Anmeldung gestartet.'); }
-    } catch {
-      if (mounted.current) setError('Das QR-Bild konnte nicht übernommen werden. Wähle ein klares PNG-, JPEG- oder WebP-Bild bis 5 MiB und 16 Megapixel mit genau einem Instagram-Eintrag.');
+      try {
+        const next = await api.saveInstagramTotp(secret);
+        if (mounted.current) { setAccount(next); setTotpMessage('Der Einrichtungsschlüssel aus dem QR-Bild wurde hinterlegt. Es wurde keine neue Anmeldung gestartet.'); }
+      } catch (cause) { if (mounted.current) setError(qrSaveError(cause)); }
     } finally { pending.current = false; if (mounted.current) setTotpBusy(null); }
   }
   async function changeTotp(kind: 'save' | 'remove', event?: FormEvent) {

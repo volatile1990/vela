@@ -80,6 +80,23 @@ def test_instagram_scope_is_explicit_and_case_insensitive(issuer, name):
     assert parse_google_migration(uri(payload([entry(issuer=issuer, name=name)]))) == EXPECTED
 
 
+@pytest.mark.parametrize("name", ["Instagram", " instagram ", "INSTAGRAM"])
+def test_legacy_version_two_with_instagram_label_and_no_issuer(name):
+    # Legacy exports omit field 3 and use the service itself as the label.
+    parameters = blob(1, RFC_SECRET) + blob(2, name.encode()) + integer(4, 1) + integer(5, 1) + integer(6, 2)
+    value = uri(payload([parameters], version=2))
+    assert parse_google_migration(value) == EXPECTED
+    assert parse_secret(value) == EXPECTED
+
+
+@pytest.mark.parametrize("issuer,name", [("Other", "Instagram"), ("Other", " instagram "), ("", "synthetic"), ("", "Instagram synthetic"), ("", "synthetic Instagram")])
+def test_bare_instagram_label_never_overrides_conflicting_issuer_or_partial_match(issuer, name):
+    value = uri(payload([entry(issuer=issuer, name=name)], version=2))
+    with pytest.raises(TOTPError) as error:
+        parse_google_migration(value)
+    assert value not in str(error.value) and EXPECTED not in str(error.value) and "synthetic" not in str(error.value)
+
+
 def test_base64_plus_is_not_form_decoded_to_space_and_urlsafe_encoding_works():
     data = payload([entry(secret=b"\xfb" * 20)])
     encoded = base64.b64encode(data).decode()

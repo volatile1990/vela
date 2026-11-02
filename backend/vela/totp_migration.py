@@ -147,8 +147,9 @@ def _parse(uri: str) -> str:
         _text(parameters[8][0], 256)  # Known opaque metadata, never retained.
     issuer = item.issuer.strip().casefold()
     label_prefix = item.name.split(":", 1)[0].strip().casefold() if ":" in item.name else ""
+    label_is_instagram = item.name.strip().casefold() == "instagram"
     if ((issuer and issuer != "instagram") or (label_prefix and label_prefix != "instagram")
-            or not (issuer == "instagram" or label_prefix == "instagram")):
+            or not (issuer == "instagram" or label_prefix == "instagram" or label_is_instagram)):
         raise MigrationError("single")
     return base64.b32encode(item.secret).decode("ascii").rstrip("=")
 

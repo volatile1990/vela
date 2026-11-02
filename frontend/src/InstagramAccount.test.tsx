@@ -195,10 +195,47 @@ describe('Instagram-Zugang und Bestätigung', () => {
     const input = await screen.findByLabelText('QR-Bild für Instagram auswählen');
     fireEvent.change(input, { target: { files: [new File(['synthetic'], 'private-qr.png', { type: 'image/png' })] } });
     await screen.findByRole('alert');
-    expect(screen.getByRole('alert')).toHaveTextContent('Das QR-Bild konnte nicht übernommen werden');
+    expect(screen.getByRole('alert')).toHaveTextContent('Das QR-Bild konnte im Browser nicht gelesen werden');
     expect(input).toHaveValue('');
     expect(screen.queryByText(/private-qr|synthetic-secret/)).not.toBeInTheDocument();
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(false);
+  });
+
+  it.each([
+    [422, 'aber der Eintrag wurde abgelehnt'],
+    [503, 'Der Instagram-Dienst ist vorübergehend nicht verfügbar'],
+    [0, 'Vela ist nicht erreichbar'],
+    [500, 'das Speichern bei Vela konnte nicht bestätigt werden'],
+  ])('unterscheidet HTTP-/Verbindungsfehler %i nach erfolgreichem QR-Lesen ohne Details anzuzeigen', async (statusCode, expected) => {
+    const initial = status({ configured: true, state: 'idle' });
+    const syntheticUri = 'otpauth-migration://offline?data=synthetic-private-secret';
+    vi.mocked(readTotpQr).mockResolvedValueOnce(syntheticUri);
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'PUT') {
+        if (statusCode === 0) throw new Error('private-qr.png ' + syntheticUri);
+        return new Response(JSON.stringify({ detail: 'private-qr.png ' + syntheticUri }), { status: Number(statusCode), headers: { 'Content-Type': 'application/json' } });
+      }
+      return json(initial);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<InstagramAccount api={new Api()} />);
+    const input = await screen.findByLabelText('QR-Bild für Instagram auswählen');
+    Object.defineProperty(input, 'value', { configurable: true, writable: true, value: 'C:\\fakepath\\private-qr.png' });
+    fireEvent.change(input, { target: { files: [new File(['synthetic'], 'private-qr.png', { type: 'image/png' })] } });
+    expect(input).toHaveValue('');
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(statusCode === 422 ? 'Das QR-Bild wurde gelesen' : 'Der QR-Code wurde gelesen');
+    expect(alert).toHaveTextContent(String(expected));
+    expect(alert).not.toHaveTextContent('QR-Bild konnte im Browser nicht gelesen werden');
+    expect(alert).not.toHaveTextContent(/private-qr|synthetic-private-secret|otpauth/);
+    expect(screen.getByLabelText('Instagram-Einrichtungsschlüssel')).toHaveValue('');
+    expect(fetchMock).toHaveBeenCalledWith('/api/instagram-account/totp', expect.objectContaining({ method: 'PUT', body: JSON.stringify({ secret: syntheticUri }) }));
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/login'))).toBe(false);
+  });
+
+  it('übernimmt auch in TOTP-API-Fehlern keine beliebigen Serverdetails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ detail: 'synthetic-private-secret' }), { status: 503, headers: { 'Content-Type': 'application/json' } })));
+    await expect(new Api().saveInstagramTotp('synthetic')).rejects.toThrow('Die Anfrage zum Einrichtungsschlüssel konnte nicht abgeschlossen werden');
   });
 
   it('sendet nach dem Verlassen keinen erst später gelesenen QR-Inhalt mehr', async () => {

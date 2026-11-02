@@ -50,6 +50,7 @@ function errorMessage(body: unknown, status: number, sourceFile = false, path = 
   }
   if (status === 413) return 'Die Datei ist zu groß. Wähle eine cookies.txt mit höchstens 256 KB.';
   if (status === 403) return 'Die Aktion konnte nicht bestätigt werden. Bitte lade die Seite neu.';
+  if (path === '/instagram-account/totp') return 'Die Anfrage zum Einrichtungsschlüssel konnte nicht abgeschlossen werden. Bitte versuche es erneut.';
   if (body && typeof body === 'object' && 'detail' in body && typeof body.detail === 'string') return body.detail;
   return 'Die Anfrage konnte nicht abgeschlossen werden. Bitte versuche es erneut.';
 }
