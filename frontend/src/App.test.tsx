@@ -24,6 +24,7 @@ function backend(existingJobs: Job[] = [], workerStatus = 'running') {
     if (url === '/api/session') return json(serverInfo);
     if (url === '/api/overview') return json(overview(workerStatus));
     if (url === '/api/source-sessions') return json({ items: [] });
+    if (url === '/api/instagram-account') return json({ configured: false, state: 'unconfigured', message: '', session_generation: 0, request_id: 0, completed_request_id: 0, interaction_id: null, browser_available: false, updated_at: null });
     if (url.startsWith('/api/jobs?')) return json({ items: existingJobs, total: existingJobs.length });
     if (url === '/api/jobs' && init?.method === 'POST') return json(job(JSON.parse(String(init.body)) as Partial<Job>), 202);
     if (url === '/api/previews') return json(job({ kind: 'probe', status: 'completed', title: 'Meine Aufnahme', metadata: { title: 'Meine Aufnahme', duration: 125, thumbnail: 'https://external.example/private.jpg' } }), 202);
@@ -172,9 +173,18 @@ describe('Vela-Arbeitsabläufe', () => {
     backend([job({ status: 'failed', url: 'https://www.instagram.com/reel/example', title: 'Eigene Aufnahme', error: 'Die Quelle verlangt eine passende Sitzung.', error_code: 'audience_restricted' })]);
     const user = userEvent.setup();
     render(<App />);
-    await user.click(await screen.findByRole('button', { name: 'Sitzung hinterlegen' }));
+    await user.click(await screen.findByRole('button', { name: 'Instagram bestätigen' }));
     expect(await screen.findByRole('heading', { name: 'Sitzungen für Quellen' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Instagram/ })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.queryByLabelText('Passwort')).not.toBeInTheDocument();
+  });
+
+  it('zeigt einen wartenden Instagram-Auftrag mit direkter Bestätigung an', async () => {
+    backend([job({ status: 'waiting_auth', url: 'https://www.instagram.com/reel/example', title: 'Eigene Aufnahme' })]);
+    const user = userEvent.setup();
+    render(<App />);
+    expect(await screen.findByText('Wartet auf Instagram', { selector: '.status-label' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Instagram bestätigen' }));
+    expect(await screen.findByRole('heading', { name: 'Instagram verbinden' })).toBeInTheDocument();
   });
 });

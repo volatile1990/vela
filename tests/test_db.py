@@ -95,6 +95,34 @@ def test_update_cannot_modify_sql_identifiers(database):
         database.update_job(job["id"], **{"url='oops'; --": "x"})
 
 
+def test_waiting_auth_is_bounded_nonterminal_and_cancel_wins(database):
+    job = database.create_job(url="https://example.com/synthetic", max_queued=1)
+    database.update_job(job["id"], status="waiting_auth", metadata={"_instagram_auth": {"attempted": True}})
+    assert database.job_counts()["active"] == 1
+    assert database.active_jobs()[0]["status"] == "waiting_auth"
+    assert database.claim_next() is None
+    with pytest.raises(OverflowError):
+        database.create_job(url="https://example.com/other", max_queued=1)
+    assert database.request_cancel(job["id"])["status"] == "cancelled"
+    assert not database.resolve_waiting_auth(job["id"], status="queued")
+    assert not database.update_waiting_auth(job["id"], error="Stale hint")
+    assert database.get_job(job["id"])["status"] == "cancelled"
+
+
+def test_auth_resume_preserves_budget_but_user_retry_resets_it(database):
+    job = database.create_job(url="https://example.com/synthetic")
+    database.claim_next()
+    metadata = {"_instagram_auth": {"attempted": True, "request_id": 7}, "title": "Synthetic"}
+    database.update_job(job["id"], status="waiting_auth", metadata=metadata)
+    assert database.resolve_waiting_auth(job["id"], status="queued")
+    resumed = database.claim_next()
+    assert resumed["attempt"] == 2
+    assert resumed["metadata"] == metadata
+    database.update_job(job["id"], status="failed")
+    retried = database.retry_job(job["id"])
+    assert retried["metadata"] == {"title": "Synthetic"}
+
+
 @pytest.mark.parametrize("version,expected", [("3.50.4", False),("3.51.2",False),("3.51.3",True),("3.52.0",True),("3.50.7",True),("3.44.6",True),("3.45.0",False)])
 def test_sqlite_patch_version_detection(version, expected):
     assert safe_sqlite_version(version) is expected

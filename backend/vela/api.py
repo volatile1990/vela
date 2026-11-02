@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -23,6 +23,7 @@ from . import __version__
 from .config import Settings
 from .db import Database
 from .source_sessions import MAX_COOKIE_BYTES, SOURCE_SITES, SourceSessionError, SourceSessionStore
+from .browser_client import BrowserClient
 
 
 class JobInput(BaseModel):
@@ -154,6 +155,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Vela", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.database, app.state.settings = database, settings
+    app.state.browser_client = BrowserClient(settings.browser_socket)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.allowed_hosts), www_redirect=False)
 
     @app.exception_handler(RequestValidationError)
@@ -173,8 +175,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
         if request.url.path.startswith("/api"):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -187,6 +190,72 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def current_session():
         # Kept as a lightweight capability response for existing browser clients.
         return {"authenticated": True, "username": None, "csrf_token": None, "version": __version__}
+
+    async def browser_body(request: Request) -> dict:
+        if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+            raise HTTPException(415, "Bitte die Eingabe als JSON übertragen.")
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > 16 * 1024:
+                raise HTTPException(413, "Die Eingabe ist zu groß.")
+            body.extend(chunk)
+        try:
+            value = json.loads(body)
+            if not isinstance(value, dict):
+                raise ValueError
+            return value
+        except (ValueError, UnicodeError):
+            raise HTTPException(422, "Die Eingabe ist nicht gültig.") from None
+
+    @app.get("/api/instagram-account")
+    async def instagram_account():
+        return await app.state.browser_client.request("GET", "/status")
+
+    @app.put("/api/instagram-account")
+    async def save_instagram_account(request: Request):
+        value = await browser_body(request)
+        username, password = value.get("username"), value.get("password")
+        if (set(value) != {"username", "password"} or not isinstance(username, str)
+                or not 1 <= len(username.strip()) <= 254 or any(ord(x) < 32 for x in username)
+                or not isinstance(password, str) or not 1 <= len(password) <= 1024):
+            raise HTTPException(422, "Bitte einen Instagram-Benutzernamen und ein Passwort eingeben.")
+        return await app.state.browser_client.request("PUT", "/account", {"username": username.strip(), "password": password})
+
+    @app.delete("/api/instagram-account")
+    async def remove_instagram_account():
+        return await app.state.browser_client.request("DELETE", "/account")
+
+    @app.post("/api/instagram-account/login")
+    async def login_instagram(request: Request):
+        if await browser_body(request) != {}:
+            raise HTTPException(422, "Die Eingabe ist nicht gültig.")
+        return await app.state.browser_client.request("POST", "/login", {})
+
+    @app.post("/api/instagram-account/action")
+    async def instagram_action(request: Request):
+        import math
+        value = await browser_body(request)
+        interaction, kind = value.get("interaction_id"), value.get("kind")
+        if (not isinstance(interaction, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", interaction)
+                or not isinstance(kind, str) or kind not in {"click", "text", "key", "scroll"}):
+            raise HTTPException(422, "Die Eingabe ist nicht gültig.")
+        fields = {"click": {"x", "y"}, "text": {"text"}, "key": {"key"}, "scroll": {"delta"}}[kind]
+        if set(value) != {"interaction_id", "kind"} | fields:
+            raise HTTPException(422, "Die Eingabe ist nicht gültig.")
+        if kind == "click" and any(type(value[x]) not in {int, float} or not math.isfinite(value[x]) or not 0 <= value[x] <= 1 for x in ("x", "y")):
+            raise HTTPException(422, "Die Position ist nicht gültig.")
+        if kind == "text" and (not isinstance(value["text"], str) or not 1 <= len(value["text"]) <= 4096):
+            raise HTTPException(422, "Die Eingabe ist nicht gültig.")
+        if kind == "key" and (not isinstance(value["key"], str) or value["key"] not in {"Enter", "Tab", "Backspace", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Escape", "Delete", "Home", "End", "Space"}):
+            raise HTTPException(422, "Diese Taste ist nicht erlaubt.")
+        if kind == "scroll" and (type(value["delta"]) is not int or not -1000 <= value["delta"] <= 1000):
+            raise HTTPException(422, "Die Eingabe ist nicht gültig.")
+        return await app.state.browser_client.request("POST", "/action", value)
+
+    @app.get("/api/instagram-account/screen")
+    async def instagram_screen():
+        content = await app.state.browser_client.request("GET", "/screen", screen=True)
+        return Response(content, media_type="image/png", headers={"Cache-Control": "no-store"})
 
     @app.exception_handler(SourceSessionError)
     async def source_session_error(request: Request, error: SourceSessionError):

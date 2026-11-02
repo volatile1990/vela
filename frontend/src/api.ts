@@ -1,6 +1,12 @@
 export type Profile = 'original' | 'compatible' | 'audio';
-export type JobStatus = 'queued' | 'probing' | 'downloading' | 'postprocessing' | 'finalizing' | 'waiting_storage' | 'interrupted' | 'completed' | 'failed' | 'cancelled';
+export type JobStatus = 'queued' | 'probing' | 'downloading' | 'postprocessing' | 'finalizing' | 'waiting_storage' | 'waiting_auth' | 'interrupted' | 'completed' | 'failed' | 'cancelled';
 export interface ServerInfo { version: string }
+export interface InstagramAccountStatus {
+  configured: boolean; state: 'unconfigured' | 'idle' | 'logging_in' | 'ready' | 'needs_attention' | 'error';
+  message: string; session_generation: number; request_id: number; completed_request_id: number;
+  interaction_id: string | null; browser_available: boolean; updated_at: string | null;
+}
+export type InstagramAction = { interaction_id: string; kind: 'click' | 'text' | 'key' | 'scroll'; x?: number; y?: number; text?: string; key?: string; delta?: number };
 export type SourceSite = 'instagram' | 'youtube' | 'tiktok' | 'facebook' | 'x';
 export interface SourceSession {
   site: SourceSite; label: string; configured: boolean; cookie_count: number;
@@ -33,10 +39,11 @@ export class ApiError extends Error {
   constructor(message: string, public status: number) { super(message); }
 }
 
-function errorMessage(body: unknown, status: number, sourceFile = false): string {
+function errorMessage(body: unknown, status: number, sourceFile = false, path = ''): string {
   if (status === 401) return 'Die Anfrage ist nicht erlaubt. Bitte lade die Seite neu.';
   if (status === 429) return 'Zu viele Versuche. Bitte warte einen Moment und versuche es erneut.';
   if (status === 422) {
+    if (path.startsWith('/instagram-account')) return 'Bitte prüfe deine Instagram-Eingaben und versuche es erneut.';
     if (sourceFile) return body && typeof body === 'object' && 'detail' in body && typeof body.detail === 'string' ? body.detail : 'Die Datei enthält keine gültige Sitzung für diese Quelle. Verwende das Netscape-Format.';
     return 'Bitte prüfe den Link und die gewählten Optionen.';
   }
@@ -47,11 +54,12 @@ function errorMessage(body: unknown, status: number, sourceFile = false): string
 }
 
 export class Api {
-  async request<T>(path: string, body?: unknown, extraHeaders?: Record<string, string>, method?: 'PUT' | 'DELETE', rawText = false): Promise<T> {
+  async request<T>(path: string, body?: unknown, extraHeaders?: Record<string, string>, method?: 'PUT' | 'DELETE', rawText = false, signal?: AbortSignal): Promise<T> {
     let response: Response;
     try {
       response = await fetch(`/api${path}`, {
         method: method ?? (body === undefined ? 'GET' : 'POST'), credentials: 'same-origin', cache: 'no-store',
+        ...(signal ? { signal } : {}),
         headers: {
           Accept: 'application/json',
           ...(body !== undefined ? { 'Content-Type': rawText ? 'text/plain;charset=UTF-8' : 'application/json' } : {}),
@@ -61,7 +69,7 @@ export class Api {
       });
     } catch { throw new ApiError('Vela ist gerade nicht erreichbar. Prüfe deine Verbindung und versuche es erneut.', 0); }
     const result: unknown = await response.json().catch(() => null);
-    if (!response.ok) throw new ApiError(errorMessage(result, response.status, rawText), response.status);
+    if (!response.ok) throw new ApiError(errorMessage(result, response.status, rawText, path), response.status);
     return result as T;
   }
 
@@ -76,13 +84,23 @@ export class Api {
   sourceSessions = () => this.request<{ items: SourceSession[] }>('/source-sessions');
   saveSourceSession = (site: SourceSite, content: string) => this.request<SourceSession>(`/source-sessions/${site}`, content, undefined, 'PUT', true);
   removeSourceSession = (site: SourceSite) => this.request<{ ok: boolean }>(`/source-sessions/${site}`, undefined, undefined, 'DELETE');
+  instagramAccount = (signal?: AbortSignal) => this.request<InstagramAccountStatus>('/instagram-account', undefined, undefined, undefined, false, signal);
+  saveInstagramAccount = (username: string, password: string) => this.request<InstagramAccountStatus>('/instagram-account', { username, password }, undefined, 'PUT');
+  loginInstagramAccount = () => this.request<InstagramAccountStatus>('/instagram-account/login', {});
+  removeInstagramAccount = () => this.request<InstagramAccountStatus>('/instagram-account', undefined, undefined, 'DELETE');
+  instagramAction = (action: InstagramAction) => this.request<InstagramAccountStatus>('/instagram-account/action', action);
+  async instagramScreen(signal?: AbortSignal): Promise<Blob> {
+    const response = await fetch('/api/instagram-account/screen', { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'image/png' }, signal });
+    if (!response.ok) throw new ApiError('Das Livebild ist gerade nicht verfügbar. Bitte versuche es erneut.', response.status);
+    return response.blob();
+  }
 }
 
 export function sourceSiteForUrl(value: string): SourceSite | null {
   try {
     const host = new URL(value).hostname.toLowerCase();
     const matches = (domain: string) => host === domain || host.endsWith(`.${domain}`);
-    if (matches('instagram.com')) return 'instagram';
+    if (matches('instagram.com') || matches('instagr.am')) return 'instagram';
     if (matches('youtube.com') || matches('youtu.be')) return 'youtube';
     if (matches('tiktok.com')) return 'tiktok';
     if (matches('facebook.com') || matches('fb.watch')) return 'facebook';
@@ -120,6 +138,6 @@ export function hostLabel(value: string): string {
 
 export const statusLabels: Record<JobStatus, string> = {
   queued: 'Wartet', probing: 'Wird geprüft', downloading: 'Lädt herunter', postprocessing: 'Wird verarbeitet',
-  finalizing: 'Wird gespeichert', waiting_storage: 'Wartet auf Speicher', interrupted: 'Unterbrochen',
+  finalizing: 'Wird gespeichert', waiting_storage: 'Wartet auf Speicher', waiting_auth: 'Wartet auf Instagram', interrupted: 'Unterbrochen',
   completed: 'Abgeschlossen', failed: 'Fehlgeschlagen', cancelled: 'Abgebrochen',
 };

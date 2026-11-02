@@ -6,13 +6,15 @@ Enthalten sind Metadatenvorschau, Video- und Audiodownloads, Auflösungswahl, Pl
 
 Vela öffnet sich **ohne Anmeldung**. Der Zugang wird auf das vertrauenswürdige Heimnetz begrenzt; alle dort zugelassenen Nutzer können Downloads und Dateien verwalten. Schreibende Browseranfragen müssen weiterhin von Vela selbst stammen.
 
-Unter **Server → Sitzungen für Quellen** kann eine selbst exportierte `cookies.txt` im Netscape-Format hochgeladen und wieder entfernt werden. Vela übernimmt nur erlaubte Domains der gewählten Quelle, zeigt keine Cookie-Werte an und liest keine Browserprofile automatisch. Eine Quellsitzung ist nur nötig, wenn die Quelle eine Anmeldung verlangt. Die Datei gehört nicht in den Chat oder ins Repository. Abrufe erfolgen direkt, ohne externe Download-Dienste.
+Unter **Server → Sitzungen für Quellen → Instagram** kann ein eigener Instagram-Zugang hinterlegt werden. Ein getrennter Browserdienst verwendet dafür ein ausschließlich für Vela angelegtes Profil auf dem Heimserver, übernimmt die Sitzung und versucht bei Bedarf eine neue Anmeldung. Verlangt Instagram eine Bestätigung, erscheint ein interaktives Anmeldefenster in Vela; wartende Aufträge können danach automatisch fortfahren. Ein dauerhaft unbeaufsichtigter Betrieb und der Zugriff auf jedes Video sind nicht garantiert.
 
-Die Anwendung verwendet Python/FastAPI, React/TypeScript/Vite und SQLite. API und Download-Worker laufen getrennt; yt-dlp, Deno und FFmpeg bilden die Engine. Die [Architekturentscheidung](docs/architecture.md) hält Aufbau und ursprüngliche Analyse fest. Der [Betrieb](docs/operations.md) beschreibt die Bereitstellung.
+Alternativ kann für die unterstützten Quellen eine selbst exportierte `cookies.txt` im Netscape-Format hochgeladen werden. Vela übernimmt nur erlaubte Domains der gewählten Quelle und liest keine persönlichen Browserprofile aus. Zugangsdaten und Cookie-Dateien gehören ausschließlich in Vela, niemals in den Chat oder ins Repository. Abrufe erfolgen direkt, ohne externe Download-Dienste.
+
+Die Anwendung verwendet Python/FastAPI, React/TypeScript/Vite und SQLite. API, Download-Worker und Instagram-Browserdienst laufen getrennt; yt-dlp, Deno und FFmpeg bilden die Engine. Die [Architekturentscheidung](docs/architecture.md) hält Aufbau und ursprüngliche Analyse fest. Der [Betrieb](docs/operations.md) beschreibt die Bereitstellung.
 
 Downloadziel ist `\\unas.home.arpa\Unprotected\Vela`, ein eigener Unterordner der gewünschten Freigabe. Die fehlende Redundanz dieses Speicherbereichs ist bewusst akzeptiert; Medienbackups gehören nicht zum Auftrag. Datenbank und temporäre Dateien bleiben auf dem Heimserver.
 
-Vela läuft unter **[https://vela.home.arpa/](https://vela.home.arpa/)** und ist in NEXUS verlinkt. Am 2. November 2026 wurden Vorschau, Video, Audio und ein öffentlicher YouTube-Download bis zur Datei auf dem UNAS einschließlich Hashprüfung bestätigt. Der Worker-Neustart ließ die API ohne Ausfall erreichbar. Die Linux-Prüfung besteht aus 161 Tests, die Frontend-Prüfung aus 18 Tests.
+Vela läuft unter **[https://vela.home.arpa/](https://vela.home.arpa/)** und ist in NEXUS verlinkt. Am 2. November 2026 wurden Vorschau, Video, Audio und ein öffentlicher YouTube-Download bis zur Datei auf dem UNAS einschließlich Hashprüfung bestätigt. Der Worker-Neustart ließ die API ohne Ausfall erreichbar. Die Linux-Prüfung besteht aus 222 Tests, die Frontend-Prüfung aus 25 Tests. Der neue Instagram-Login benötigt für die abschließende Kontoprüfung einen vom Nutzer direkt in Vela hinterlegten Zugang.
 
 Vela wird direkt auf dem Heimserver bereitgestellt. Eine Veröffentlichung in Orbit erfolgt ausschließlich auf ausdrücklichen Nutzerauftrag; der vorübergehend angelegte Katalogeintrag wurde auf Nutzerwunsch zurückgenommen.
 

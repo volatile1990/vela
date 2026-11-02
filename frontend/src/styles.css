@@ -463,6 +463,39 @@ svg { display: inline-block; flex-shrink: 0; vertical-align: middle; }
 .source-instructions p { margin-top: 13px; max-width: 700px; }
 .source-loading { display: flex; align-items: center; gap: 10px; padding: 30px 0; color: var(--muted); font-size: 13px; }
 .session-shortcut { margin: 7px 0 5px; min-height: 32px; }
+.source-manual { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+.source-manual > summary, .ig-replace > summary { cursor: pointer; color: #d5deeb; font-size: 13px; padding: 7px 0; }
+.ig-account { padding-top: 25px; }
+.ig-account > .section-heading { align-items: flex-start; }
+.ig-account h3 { font-size: 17px; }
+.ig-account .source-intro { max-width: 630px; }
+.ig-account-state { flex-shrink: 0; color: var(--muted); font-size: 12px; line-height: 1.8; }
+.ig-status-message { color: #d0d9e7; font-size: 13px; line-height: 1.8; margin: 12px 0 18px; }
+.ig-credentials fieldset { border: 0; padding: 0; margin: 20px 0; min-width: 0; }
+.ig-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 17px; margin-bottom: 18px; }
+.ig-fields label, .ig-text-input > label { display: block; color: #d3dce9; font-size: 12px; margin-bottom: 8px; }
+.ig-fields input { width: 100%; font-size: 15px; min-height: 44px; }
+.ig-account-actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 18px 0 13px; }
+.ig-replace { margin: 10px 0 20px; }
+.ig-confirmation { margin-top: 18px; }
+.ig-confirmation > .source-note { margin: 10px 0 0; }
+.ig-live-browser { margin-top: 22px; padding: 20px; border: 1px solid #526177; border-radius: 9px; background: #131c28; }
+.ig-live-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
+.ig-live-heading h4 { margin: 0; font-size: 15px; }
+.ig-screen-scroll { max-width: 100%; max-height: 70vh; overflow: auto; border: 1px solid #536074; border-radius: 7px; background: #fff; }
+.ig-screen-target { display: block; width: 100%; padding: 0; border: 0; background: #fff; cursor: crosshair; max-width: 100%; }
+.ig-screen-target.zoomed { width: 1000px; min-width: 1000px; max-width: none; }
+.ig-screen-target:disabled { opacity: 1; cursor: wait; }
+.ig-screen-target img { display: block; width: 100%; height: auto; }
+.ig-screen-scroll .source-loading { color: #354052; justify-content: center; padding: 40px 15px; }
+.ig-text-input { margin-top: 22px; }
+.ig-text-input > div { display: flex; gap: 10px; }
+.ig-text-input input { flex: 1; width: 100%; min-width: 0; font-size: 16px; }
+.ig-browser-keys { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
+.ig-browser-keys .button { min-width: 44px; min-height: 44px; padding-inline: 12px; }
+.ig-scroll-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 5px; }
+.ig-privacy-note { margin: 16px 0 0; font-size: 11px; line-height: 1.8; color: var(--muted); }
+.status-label.waiting_auth { color: var(--amber); }
 @media (max-width: 640px) {
   .source-sessions { padding: 21px 17px; }
   .source-picker { gap: 7px; }
@@ -477,4 +510,13 @@ svg { display: inline-block; flex-shrink: 0; vertical-align: middle; }
   .source-actions .button { padding-inline: 11px; font-size: 12px; min-height: 44px; }
   .source-instructions { font-size: 12px; }
   .session-shortcut { font-size: 12px; min-height: 40px; }
+  .ig-account > .section-heading { flex-direction: column; gap: 10px; }
+  .ig-fields { grid-template-columns: 1fr; gap: 15px; }
+  .ig-fields input { font-size: 16px; }
+  .ig-account-state { font-size: 12px; }
+  .ig-live-browser { padding: 14px 11px; margin-inline: -5px; }
+  .ig-text-input > div { flex-direction: column; }
+  .ig-text-input .button { min-height: 44px; }
+  .ig-scroll-actions { gap: 3px; }
+  .ig-scroll-actions .button { font-size: 11px; padding-inline: 9px; }
 }

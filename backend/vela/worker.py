@@ -15,6 +15,13 @@ from .config import Settings
 from .db import Database
 from .engine import Engine, EngineError, EngineCancelled, recover_process, validate_source_url
 from .storage import Storage, StorageError
+from .source_sessions import SourceSessionStore, site_for_url
+
+
+AUTH_REFRESH_ERRORS = frozenset({"login_required", "session_invalid", "audience_restricted", "access_denied"})
+AUTH_WAIT_MESSAGE = "Vela erneuert die Instagram-Sitzung. Der Auftrag wird anschließend automatisch fortgesetzt."
+AUTH_ATTENTION_MESSAGE = "Instagram benötigt deine Bestätigung. Öffne die Instagram-Anmeldung in Vela und schließe sie ab."
+AUTH_FAILED_MESSAGE = "Die Instagram-Anmeldung konnte nicht abgeschlossen werden. Bitte die Anmeldung in Vela prüfen."
 
 
 def utcnow() -> str:
@@ -76,16 +83,20 @@ def selected_indexes(expression: str | None, count: int, limit: int) -> list[int
 
 class Worker:
     def __init__(self, settings: Settings, *, db: Database | None = None,
-                 engine: Engine | None = None, storage: Storage | None = None):
+                 engine: Engine | None = None, storage: Storage | None = None,
+                 instagram_auth: Any | None = None, session_store: Any | None = None):
         self.settings = settings
         self.db = db or Database(settings.db_path)
         self.engine = engine or Engine(timeout=settings.job_timeout_seconds,
-            probe_timeout=settings.probe_timeout_seconds, credentials_dir=settings.credentials_dir)
+            probe_timeout=settings.probe_timeout_seconds, credentials_dir=getattr(settings, "credentials_dir", None))
         self.storage = storage or Storage(settings.download_dir, marker=settings.storage_marker_name,
             marker_value=settings.storage_marker, reserve_bytes=settings.min_free_bytes)
         self.stop = asyncio.Event()
         self.active_cancels: set[asyncio.Event] = set()
         self.last_storage_retry = 0.0
+        self.instagram_auth = instagram_auth
+        self._auth_checked = instagram_auth is not None
+        self.session_store = session_store or SourceSessionStore(getattr(settings, "credentials_dir", Path("/credentials")))
 
     async def run(self) -> None:
         self.db.initialize()
@@ -102,6 +113,7 @@ class Worker:
             running: dict[str, asyncio.Task] = {}
             try:
                 while not self.stop.is_set():
+                    self.retry_auth_waiters()
                     if time.monotonic() - self.last_storage_retry >= 15:
                         self.last_storage_retry = time.monotonic()
                         await self.retry_finalizations()
@@ -162,6 +174,10 @@ class Worker:
                 self.cleanup(directory)
             elif job["status"] in ("finalizing", "waiting_storage") and job.get("metadata", {}).get("finalization"):
                 self.db.update_job(job["id"], status="waiting_storage", phase="finalizing", error=None, error_code=None)
+            elif job["status"] == "waiting_auth":
+                # A restart must not spend another login budget or restart the
+                # downloader while a challenge is still awaiting the user.
+                continue
             else:
                 self.db.update_job(job["id"], status="queued", phase="queued", error=None, error_code=None)
         # A previously reconciled queued attempt can still carry a crash
@@ -184,6 +200,145 @@ class Worker:
             (directory / ".vela-cookies.txt").unlink(missing_ok=True)
         except OSError:
             raise EngineError("Die temporäre Sitzung eines unterbrochenen Auftrags konnte nicht bereinigt werden.", "session_cleanup") from None
+
+    def _auth(self):
+        if not self._auth_checked:
+            self._auth_checked = True
+            try:
+                from .instagram_auth import InstagramAuthState
+            except ModuleNotFoundError as exc:
+                if exc.name != "vela.instagram_auth":
+                    raise
+            else:
+                self.instagram_auth = InstagramAuthState(self.settings.state_dir)
+        return self.instagram_auth
+
+    @staticmethod
+    def _counter(value: Any) -> int:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+    def _session_valid(self) -> bool:
+        status = self.session_store.status("instagram")
+        return bool(status.get("configured")) and status.get("state") == "configured"
+
+    def _metadata(self, job_id: str, incoming: dict[str, Any]) -> dict[str, Any]:
+        """Preserve controller bookkeeping when the engine replaces metadata."""
+        result = dict(incoming)
+        result.pop("_instagram_auth", None)
+        current = self.db.get_job(job_id)
+        record = current.get("metadata", {}).get("_instagram_auth") if current else None
+        if isinstance(record, dict):
+            result["_instagram_auth"] = record
+        return result
+
+    def _request_auth_refresh(self, job: dict, record: dict, auth) -> None:
+        if self._counter(record.get("request_id")):
+            return
+        current = self.db.get_job(job["id"])
+        if current is None or current["status"] != "waiting_auth" or current.get("cancel_requested"):
+            return
+        request_id = self._counter(auth.request_refresh(force=False))
+        if request_id:
+            current = self.db.get_job(job["id"])
+            if current is None or current["status"] != "waiting_auth" or current.get("cancel_requested"):
+                return
+            metadata = dict(current.get("metadata") or {})
+            record = dict(record, request_id=request_id)
+            metadata["_instagram_auth"] = record
+            self.db.update_waiting_auth(job["id"], metadata=metadata)
+
+    def _reconcile_auth_request(self, job: dict, record: dict, status: dict) -> dict:
+        """Bridge a crash between the auth DB request and the job DB receipt."""
+        if self._counter(record.get("request_id")) or "baseline_request_id" not in record:
+            return record
+        baseline = self._counter(record.get("baseline_request_id"))
+        baseline_completed = self._counter(record.get("baseline_completed_request_id"))
+        current_request = self._counter(status.get("request_id"))
+        request_id = 0
+        if current_request > baseline:
+            request_id = current_request
+        elif baseline > baseline_completed and current_request >= baseline:
+            request_id = baseline
+        if request_id:
+            record = dict(record, request_id=request_id)
+            metadata = dict(job.get("metadata") or {})
+            metadata["_instagram_auth"] = record
+            self.db.update_waiting_auth(job["id"], metadata=metadata)
+        return record
+
+    def defer_instagram_auth(self, job: dict, error: EngineError | None = None) -> bool:
+        """Persist the single refresh budget before requesting browser work."""
+        if site_for_url(job["url"]) != "instagram" or (error is not None and error.category not in AUTH_REFRESH_ERRORS):
+            return False
+        current = self.db.get_job(job["id"]) or job
+        if isinstance(current.get("metadata", {}).get("_instagram_auth"), dict):
+            return False
+        auth = self._auth()
+        if auth is None:
+            return False
+        status = auth.status()
+        if not status.get("configured") or (error is None and self._session_valid()):
+            return False
+        if current.get("cancel_requested") or self.stop.is_set():
+            return False
+        record = {"attempted": True, "request_id": None,
+            "session_generation": self._counter(status.get("session_generation")),
+            "baseline_request_id": self._counter(status.get("request_id")),
+            "baseline_completed_request_id": self._counter(status.get("completed_request_id")),
+            "original_error": str(error) if error else None,
+            "original_error_code": error.category if error else None}
+        metadata = dict(current.get("metadata") or {})
+        metadata["_instagram_auth"] = record
+        self.db.update_job(job["id"], metadata=metadata, status="waiting_auth", phase="waiting_auth",
+            error=AUTH_WAIT_MESSAGE, error_code="waiting_auth", heartbeat_at=None)
+        self._request_auth_refresh(job, record, auth)
+        return True
+
+    def _auth_failure(self, job: dict) -> None:
+        record = job.get("metadata", {}).get("_instagram_auth", {})
+        if not isinstance(record, dict):
+            record = {}
+        message = record.get("original_error") or AUTH_FAILED_MESSAGE
+        category = record.get("original_error_code") or "auth_failed"
+        self.db.resolve_waiting_auth(job["id"], status="failed", error=message, error_code=category)
+
+    def retry_auth_waiters(self) -> None:
+        jobs = [job for job in self.db.active_jobs() if job["status"] == "waiting_auth"]
+        if not jobs or self.stop.is_set():
+            return
+        auth = self._auth()
+        status = auth.status() if auth is not None else {}
+        session_valid: bool | None = None
+        for job in jobs:
+            if job.get("cancel_requested"):
+                if self.db.resolve_waiting_auth(job["id"], status="cancelled"):
+                    self.cleanup(self.work_path(job["id"]))
+                continue
+            record = job.get("metadata", {}).get("_instagram_auth")
+            if site_for_url(job["url"]) != "instagram" or not isinstance(record, dict) or not status.get("configured"):
+                self._auth_failure(job)
+                continue
+            record = self._reconcile_auth_request(job, record, status)
+            request_id = self._counter(record.get("request_id"))
+            completed = self._counter(status.get("completed_request_id"))
+            generation_changed = self._counter(status.get("session_generation")) > self._counter(record.get("session_generation"))
+            request_completed = bool(request_id) and completed >= request_id
+            if status.get("state") == "ready" and (generation_changed or request_completed):
+                if session_valid is None:
+                    session_valid = self._session_valid()
+                if session_valid:
+                    self.db.resolve_waiting_auth(job["id"], status="queued")
+                else:
+                    self._auth_failure(job)
+            elif status.get("state") == "error" and request_completed:
+                self._auth_failure(job)
+            else:
+                if not request_id:
+                    self._request_auth_refresh(job, record, auth)
+                message = AUTH_ATTENTION_MESSAGE if status.get("state") == "needs_attention" else AUTH_WAIT_MESSAGE
+                code = "auth_attention" if status.get("state") == "needs_attention" else "waiting_auth"
+                if job.get("error") != message or job.get("error_code") != code:
+                    self.db.update_waiting_auth(job["id"], error=message, error_code=code)
 
     async def _heartbeat(self) -> None:
         while True:
@@ -232,7 +387,7 @@ class Worker:
         async def event(kind: str, payload: dict[str, Any]) -> None:
             nonlocal last_progress
             if kind == "metadata":
-                self.db.update_job(job_id, metadata=payload, title=payload["title"],
+                self.db.update_job(job_id, metadata=self._metadata(job_id, payload), title=payload["title"],
                     media_id=payload["id"], extractor=payload["extractor"])
             elif kind == "source_session":
                 current = self.db.get_job(job_id)
@@ -252,9 +407,14 @@ class Worker:
         try:
             validate_source_url(job["url"])
             await asyncio.to_thread(self.check_work)
+            if cancel.is_set() or self.stop.is_set():
+                raise EngineCancelled()
+            if self.defer_instagram_auth(job):
+                return
             if job["kind"] == "probe" or job.get("playlist"):
                 info = await self.engine.probe(job["url"], directory, cancel=cancel,
                     playlist_limit=min(100, self.settings.max_playlist_items))
+                info = self._metadata(job_id, info)
                 self.db.update_job(job_id, metadata=info, title=info["title"], media_id=info["id"], extractor=info["extractor"])
                 if job["kind"] == "probe":
                     self.db.update_job(job_id, status="completed", phase="completed", progress=100, finished_at=utcnow())
@@ -269,7 +429,7 @@ class Worker:
                 max_height=job.get("max_height") or 2160, cancel=cancel, on_event=event)
             # This durable journal precedes all NAS writes. Repeating the copy
             # after a crash discovers an already-published identical file.
-            metadata = dict(result.metadata)
+            metadata = self._metadata(job_id, result.metadata)
             metadata["finalization"] = [{"source": file.relative_to(directory.resolve()).as_posix(),
                 "title": metadata.get("title") or "Medium"} for file in result.files]
             self.db.update_job(job_id, metadata=metadata, status="finalizing", phase="finalizing", progress=100)
@@ -287,6 +447,20 @@ class Worker:
         except StorageError as exc:
             self.storage_failure(job_id, exc)
         except EngineError as exc:
+            current = self.db.get_job(job_id)
+            if self.stop.is_set():
+                self.db.update_job(job_id, status="interrupted", phase="interrupted", error="Worker wird neu gestartet.", error_code="interrupted")
+                return
+            if current and current.get("cancel_requested"):
+                self.db.update_job(job_id, status="cancelled", phase="cancelled", finished_at=utcnow())
+                self.cleanup(directory)
+                return
+            if self.defer_instagram_auth(job, exc):
+                return
+            current = self.db.get_job(job_id)
+            record = current.get("metadata", {}).get("_instagram_auth", {}) if current else {}
+            if exc.category in AUTH_REFRESH_ERRORS and isinstance(record, dict) and record.get("original_error_code"):
+                exc = EngineError(record["original_error"], record["original_error_code"])
             self.db.update_job(job_id, status="failed", phase="failed", error=str(exc), error_code=exc.category, finished_at=utcnow())
             if exc.category == "work_full":
                 self.cleanup(directory)

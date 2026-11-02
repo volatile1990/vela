@@ -3,6 +3,7 @@ import type { ChangeEvent } from 'react';
 import { Api, formatBytes, sourceSites } from './api';
 import type { SourceSession, SourceSite } from './api';
 import { Icon } from './icons';
+import InstagramAccount from './InstagramAccount';
 
 const MAX_SIZE = 256 * 1024;
 const stateLabels = { missing: 'Nicht hinterlegt', configured: 'Hinterlegt', expired: 'Abgelaufen', invalid: 'Erneuern erforderlich' };
@@ -85,6 +86,8 @@ export default function SourceSessions({ api, initialSite = 'instagram', focusOn
       const info = items.find(item => item.site === source.site);
       return <button key={source.site} type="button" disabled={busy} aria-pressed={selectedSite === source.site} className={selectedSite === source.site ? 'selected' : ''} onClick={() => chooseSite(source.site)}><span className={`status-dot ${info?.state === 'configured' ? 'good' : info?.state === 'expired' || info?.state === 'invalid' ? 'warning' : ''}`} /><span>{source.label}</span><span className="sr-only">{loading ? 'Wird geladen' : stateLabels[info?.state ?? 'missing']}</span></button>;
     })}</div>
+    {selectedSite === 'instagram' && <InstagramAccount api={api} onSessionChange={() => void load()} />}
+    <details className="source-manual"><summary>Manuelle Cookies importieren (optional)</summary>
     {loading ? <div className="source-loading" role="status"><span className="spinner" />Sitzungen werden geladen …</div> : <>
       <div className="source-status"><div><h3>{label}</h3><span className={`source-state ${state === 'configured' ? 'good-text' : state === 'expired' || state === 'invalid' ? 'warning-text' : ''}`}>{stateLabels[state]}</span></div>{hasSession && <dl><div><dt>Ablauf</dt><dd>{dateLabel(selected?.expires_at)}</dd></div>{selected?.updated_at && <div><dt>Aktualisiert</dt><dd>{dateLabel(selected.updated_at)}</dd></div>}{selected?.configured && <div><dt>Übernommen</dt><dd>{selected.cookie_count} {selected.cookie_count === 1 ? 'Cookie' : 'Cookies'}</dd></div>}</dl>}</div>
       {state === 'configured' && <p className="source-note">Hinterlegt bedeutet, dass Vela die Datei lesen kann. Die Quelle kann eine Sitzung vorzeitig beenden.</p>}
@@ -94,6 +97,7 @@ export default function SourceSessions({ api, initialSite = 'instagram', focusOn
     </>}
     {error && <div className="notice error" role="alert"><Icon name="alert" size={18} /><span>{error}</span>{!items.length && !loading && <button className="text-button" onClick={() => void load()}>Erneut laden</button>}</div>}
     {message && <div className="notice success" role="status"><Icon name="check" size={18} /><span>{message}</span></div>}
-    <details className="source-instructions"><summary>So hinterlegst du eine Sitzung</summary><ol><li>Öffne die gewählte Quelle in deinem Browser und melde dich dort an.</li><li>Exportiere die Cookies dieser Quelle als cookies.txt im Netscape-Format. <a className="text-button" href="https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp" target="_blank" rel="noopener noreferrer">Anleitung zum Cookie-Export <Icon name="external" size={13} /></a></li><li>Wähle hier die passende Quelle und die Datei. Klicke anschließend auf „Sitzung hinterlegen“.</li><li>Wiederhole danach den fehlgeschlagenen Download.</li></ol><p>Vela übernimmt ausschließlich erlaubte Domains der gewählten Quelle und verwendet die Sitzung nur für passende direkte Abrufe. Cookie-Werte werden hier nicht angezeigt. Teile die Datei nicht im Chat.</p><p>Hinterlegte Sitzungen stehen Downloads im vertrauenswürdigen Heimnetz zur Verfügung. Vela öffnet keine Browserprofile automatisch. Die Sitzung liegt auf deinem Heimserver und kann hier jederzeit entfernt werden.</p></details>
+    <details className="source-instructions"><summary>So importierst du Cookies manuell</summary><ol><li>Öffne die gewählte Quelle in deinem Browser und melde dich dort an.</li><li>Exportiere die Cookies dieser Quelle als cookies.txt im Netscape-Format. <a className="text-button" href="https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp" target="_blank" rel="noopener noreferrer">Anleitung zum Cookie-Export <Icon name="external" size={13} /></a></li><li>Wähle hier die passende Quelle und die Datei. Klicke anschließend auf „Sitzung hinterlegen“.</li><li>Wiederhole danach den fehlgeschlagenen Download.</li></ol><p>Vela übernimmt ausschließlich erlaubte Domains der gewählten Quelle und verwendet die Sitzung nur für passende direkte Abrufe. Cookie-Werte werden hier nicht angezeigt. Teile die Datei nicht im Chat.</p><p>Hinterlegte Sitzungen stehen Downloads im vertrauenswürdigen Heimnetz zur Verfügung. Vela liest keine persönlichen Browserprofile automatisch aus. Die Sitzung liegt auf deinem Heimserver und kann hier jederzeit entfernt werden.</p></details>
+    </details>
   </section>;
 }

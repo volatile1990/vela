@@ -1,5 +1,6 @@
 .git
 .venv
+**/*.egg-info
 __pycache__
 **/__pycache__
 .pytest_cache
@@ -9,6 +10,10 @@ output
 *.dpapi
 *.env
 credentials
+browser-profile
+browser-secrets
+browser-control
+**/*.enc
 **/cookies.txt
 **/*.cookies.txt
 **/*.cookies

@@ -21,6 +21,11 @@ services:
       VELA_TRUSTED_PROXIES: 172.29.50.0/28
     volumes:
       - type: bind
+        source: /srv/vela/browser-control
+        target: /browser-control
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
         source: /srv/vela/credentials
         target: /credentials
         bind: {create_host_path: false}
@@ -89,6 +94,62 @@ services:
         ipv4_address: 172.29.51.2
     healthcheck:
       test: [CMD, python, -m, vela.cli, health, worker]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
+    logging: {driver: local, options: {max-size: 10m, max-file: "3"}}
+  browser:
+    image: ${VELA_BROWSER_IMAGE:-vela-browser:1.0.0}
+    container_name: vela-browser
+    init: true
+    user: "10020:10020"
+    restart: "no"
+    stop_grace_period: 25s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 768m
+    memswap_limit: 768m
+    cpus: 0.75
+    pids_limit: 256
+    shm_size: 128m
+    ulimits:
+      core: 0
+    environment:
+      VELA_STATE_DIR: /state
+      VELA_CREDENTIALS_DIR: /credentials
+      VELA_BROWSER_SECRETS_DIR: /browser-secrets
+      VELA_BROWSER_PROFILE_DIR: /browser-profile
+      VELA_BROWSER_CONTROL_SOCKET: /browser-control/control.sock
+      VELA_CHROMIUM_EXECUTABLE: /usr/bin/chromium
+    volumes:
+      - type: bind
+        source: /srv/vela/state
+        target: /state
+        bind: {create_host_path: false}
+      - type: bind
+        source: /srv/vela/credentials
+        target: /credentials
+        bind: {create_host_path: false}
+      - type: bind
+        source: /srv/vela/browser-control
+        target: /browser-control
+        bind: {create_host_path: false}
+      - type: bind
+        source: /srv/vela/browser-secrets
+        target: /browser-secrets
+        bind: {create_host_path: false}
+      - type: bind
+        source: /srv/vela/browser-profile
+        target: /browser-profile
+        bind: {create_host_path: false}
+    tmpfs: ["/tmp:size=128m,mode=1777"]
+    networks:
+      worker:
+        ipv4_address: 172.29.51.3
+    healthcheck:
+      test: [CMD, python, -c, "import httpx; t=httpx.HTTPTransport(uds='/browser-control/control.sock'); c=httpx.Client(transport=t,timeout=4,trust_env=False); assert c.get('http://vela-browser/status').status_code==200"]
       interval: 30s
       timeout: 6s
       retries: 3

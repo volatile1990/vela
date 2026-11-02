@@ -45,6 +45,16 @@ ENV HOME=/work DENO_DIR=/work/.deno XDG_CACHE_HOME=/work/.cache
 USER 10020:10020
 CMD ["python", "-m", "vela.cli", "worker"]
 
+FROM base AS browser
+RUN apt-get update && apt-get install -y --no-install-recommends chromium ca-certificates fonts-liberation \
+ && rm -rf /var/lib/apt/lists/*
+COPY pyproject.toml requirements.lock ./
+COPY backend/ ./backend/
+RUN pip install --no-cache-dir -c requirements.lock '.[browser]'
+ENV HOME=/browser-profile VELA_CHROMIUM_EXECUTABLE=/usr/bin/chromium
+USER 10020:10020
+CMD ["python", "-m", "vela.browser_service"]
+
 FROM worker AS test
 USER root
 RUN pip install --no-cache-dir '.[test]'

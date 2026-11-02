@@ -6,10 +6,12 @@ import subprocess
 BASE = Path('/etc/systemd/system')
 
 
-def put(name, content):
+def put(name, content, *, previous=None):
     target = BASE / name
     if target.exists() and target.read_text() != content:
-        raise RuntimeError('existing_unit_conflict:' + name)
+        if previous is None or target.read_text() != previous:
+            raise RuntimeError('existing_unit_conflict:' + name)
+        target.write_text(content)
     if not target.exists():
         target.write_text(content)
 
@@ -29,7 +31,7 @@ ExecStart=/usr/bin/python3 /opt/vela/current/deploy/network.py
 [Install]
 WantedBy=multi-user.target
 ''')
-for role in ('api', 'worker'):
+for role in ('api', 'worker', 'browser'):
     put('vela-' + role + '.service', f'''[Unit]
 Description=Vela {role}
 Requires=docker.service vela-network.service srv-vela-work.mount srv-vela-library.mount
@@ -50,13 +52,14 @@ TimeoutStopSec=45
 [Install]
 WantedBy=multi-user.target
 ''')
-put('vela.target', '''[Unit]
+old_target = '''[Unit]
 Description=Vela media downloader
 Wants=vela-api.service vela-worker.service
 After=vela-api.service vela-worker.service
 [Install]
 WantedBy=multi-user.target
-''')
+'''
+put('vela.target', old_target.replace('vela-api.service vela-worker.service', 'vela-api.service vela-worker.service vela-browser.service'), previous=old_target)
 subprocess.run(['systemctl', 'daemon-reload'], check=True)
-subprocess.run(['systemctl', 'enable', 'vela-network.service', 'vela-api.service', 'vela-worker.service', 'vela.target'], check=True)
+subprocess.run(['systemctl', 'enable', 'vela-network.service', 'vela-api.service', 'vela-worker.service', 'vela-browser.service', 'vela.target'], check=True)
 print('Vela service units installed')

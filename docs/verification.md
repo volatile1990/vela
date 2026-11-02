@@ -37,4 +37,12 @@ Die neue API liefert die fünf Quellsitzungszustände. Ungültiger Import endet 
 
 Der untersuchte Instagram-Abruf wurde von der Quelle anonym mit einer Zielgruppenbeschränkung abgelehnt. Ein gültiger Sitzungsexport des Nutzers liegt bei dieser Abnahme noch nicht vor; ein erfolgreicher Download dieses konkreten Videos ist deshalb ausdrücklich nicht bestätigt. Externe Portale werden nicht als Fallback verwendet.
 
-Aktuelle Images: API `sha256:00f59fbe18558019399768e5dd88327459372357cff8793e52ef14c1fcb0ac87`, Worker `sha256:be655906afe87175355725a3213fcfde742b53591eaf808958f69c072e58814f`; beide `healthy`. Die vorangehenden Images und Prüfdaten dokumentieren den früheren Stand.
+Images dieser Erweiterung: API `sha256:00f59fbe18558019399768e5dd88327459372357cff8793e52ef14c1fcb0ac87`, Worker `sha256:be655906afe87175355725a3213fcfde742b53591eaf808958f69c072e58814f`; beide bei dieser Abnahme `healthy`. Die vorangehenden Images und Prüfdaten dokumentieren den früheren Stand.
+
+## Instagram-Anmeldung mit eigenem Browserprofil
+
+Die Buildprüfung des neuen Stands besteht aus **222 bestandenen Linux-Tests** und **25 bestandenen Frontendtests** einschließlich Production-Build. Synthetische Prüfungen decken verschlüsselte Zugangsspeicherung, Dateirechte, Kontowechsel, Wiederanlauf ohne wiederholte Passwortversuche, Challenge → Ready, automatische Fortsetzung und die Begrenzung der Erneuerung pro Nutzer-Versuch ab. Drei reproduzierte Nebenläufigkeitsfehler beim Entfernen beziehungsweise Öffnen wurden korrigiert und durch Regressionstests abgesichert.
+
+Ein echter Chromium 156.0.8078.73 erreichte die Instagram-Anmeldeseite mit HTTP 200 unter den vorgesehenen Containergrenzen, ohne Anmeldedaten zu verwenden oder einen Login abzusenden. Der echte Vela-Controller lieferte anschließend ein 92.214 Byte großes PNG und nahm eine begrenzte Tastenaktion an. Ein synthetisches Passwortfeld mit sichtbarem Text wurde bei zwei unterschiedlichen Werten in identische maskierte PNGs umgewandelt. Die aktuelle Formularvariante mit `email`/`pass`, Submit-Input und Cookie-Dialog wird berücksichtigt.
+
+Eine reale Netzwerkprobe vom vorgesehenen Browserplatz im Workernetz bestätigte öffentlichen HTTPS-Zugriff und blockierte Verbindungen zu Heimserver, NAS, Bridge-Gateway, API und IPv6. Die abschließende Bereitstellung wird separat mit Quellcommit und Imageidentitäten protokolliert. Ein echter Instagram-Login und der Download des ursprünglichen Nutzervideos sind bis zur Bereitstellung eines berechtigten Nutzerkontos offen; die synthetischen Prüfungen ersetzen diese Abnahme nicht.

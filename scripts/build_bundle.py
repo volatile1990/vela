@@ -21,7 +21,7 @@ def main():
         raise SystemExit('Existing bundle directory: inspect before rebuilding')
     bundle.mkdir()
     images = {}
-    for name in ('vela-api:1.0.0', 'vela-worker:1.0.0'):
+    for name in ('vela-api:1.0.0', 'vela-worker:1.0.0', 'vela-browser:1.0.0'):
         images[name] = subprocess.run(['docker', 'image', 'inspect', name, '--format', '{{.Id}}'],
             check=True, capture_output=True, text=True).stdout.strip()
     with gzip.open(bundle / 'images.tar.gz', 'wb', compresslevel=2) as archive:

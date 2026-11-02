@@ -45,7 +45,7 @@ describe('Sitzungen für Quellen', () => {
     await user.upload(screen.getByLabelText('cookies.txt für Instagram auswählen'), new File([new Uint8Array(256 * 1024 + 1)], 'cookies.txt', { type: 'text/plain' }));
     expect(screen.getByRole('alert')).toHaveTextContent('höchstens 256 KB');
     expect(screen.getByRole('button', { name: 'Sitzung hinterlegen' })).toBeDisabled();
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalledWith('/api/source-sessions/instagram', expect.objectContaining({ method: 'PUT' }));
   });
 
   it('entfernt eine abgelaufene Sitzung ohne Cookie-Inhalte zu lesen', async () => {

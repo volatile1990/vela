@@ -14,6 +14,7 @@ class Settings:
     work_dir: Path = Path("/work")
     download_dir: Path = Path("/downloads")
     credentials_dir: Path = Path("/credentials")
+    browser_socket: Path = Path("/browser-control/control.sock")
     frontend_dir: Path = Path("/app/frontend/dist")
     base_url: str = "https://vela.home.arpa"
     worker_stale_seconds: int = 45
@@ -64,6 +65,7 @@ class Settings:
             work_dir=Path(os.environ.get("VELA_WORK_DIR", "/work")),
             download_dir=Path(os.environ.get("VELA_DOWNLOAD_DIR", "/downloads")),
             credentials_dir=Path(os.environ.get("VELA_CREDENTIALS_DIR", "/credentials")),
+            browser_socket=Path(os.environ.get("VELA_BROWSER_SOCKET", "/browser-control/control.sock")),
             frontend_dir=Path(os.environ.get("VELA_FRONTEND_DIR", "/app/frontend/dist")),
             base_url=os.environ.get("VELA_BASE_URL", "https://vela.home.arpa").rstrip("/"),
             worker_stale_seconds=int(os.environ.get("VELA_WORKER_STALE_SECONDS", "45")),

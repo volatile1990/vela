@@ -16,7 +16,9 @@ for name,expected in manifest['images'].items():
  if actual!=expected:raise SystemExit('Image-Prüfung fehlgeschlagen: '+name)
 PY
 /usr/bin/python3 source/deploy/start_guard.py api
-systemctl stop vela-api.service vela-worker.service
+/usr/bin/python3 source/deploy/prepare_browser.py
+/usr/bin/python3 source/deploy/install_units.py
+systemctl stop vela-api.service vela-worker.service vela-browser.service
 release_dir="/opt/vela/releases/1.0.0-orbit-$(sha256sum release.json | cut -c1-12)"
 if [ ! -d "$release_dir" ]; then
     mkdir -m 755 "$release_dir"
@@ -25,11 +27,12 @@ fi
 ln -s "$release_dir" /opt/vela/current.orbit-new
 mv -Tf /opt/vela/current.orbit-new /opt/vela/current
 python3 /opt/vela/current/deploy/install_units.py
-systemctl start vela-api.service vela-worker.service
+systemctl start vela-browser.service vela-api.service vela-worker.service
 ready=0
 for attempt in $(seq 1 30); do
     if docker exec vela-api python -c "import urllib.request; r=urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8080/api/health',headers={'Host':'vela.home.arpa'}),timeout=2); assert r.status==200" >/dev/null 2>&1 \
-       && docker exec vela-worker python -m vela.cli health worker >/dev/null 2>&1; then
+       && docker exec vela-worker python -m vela.cli health worker >/dev/null 2>&1 \
+       && docker exec vela-browser python -c "import httpx; c=httpx.Client(transport=httpx.HTTPTransport(uds='/browser-control/control.sock'),timeout=3,trust_env=False); assert c.get('http://vela-browser/status').status_code==200" >/dev/null 2>&1; then
         ready=1
         break
     fi

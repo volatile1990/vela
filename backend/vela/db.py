@@ -15,7 +15,7 @@ except ImportError:
     import sqlite3
 
 
-STATES = frozenset({"queued", "probing", "downloading", "postprocessing", "finalizing", "waiting_storage", "interrupted", "completed", "failed", "cancelled"})
+STATES = frozenset({"queued", "probing", "downloading", "postprocessing", "finalizing", "waiting_storage", "waiting_auth", "interrupted", "completed", "failed", "cancelled"})
 TERMINAL = frozenset({"completed", "failed", "cancelled"})
 ACTIVE = STATES - TERMINAL - {"queued"}
 UPDATE_FIELDS = frozenset({"metadata", "title", "media_id", "extractor", "status", "phase", "progress", "downloaded_bytes", "total_bytes", "speed", "eta", "error", "error_code", "heartbeat_at", "cancel_requested", "finished_at"})
@@ -127,7 +127,7 @@ class Database:
                     if expected != actual:
                         raise ValueError("Idempotency key was already used for a different request")
                     return self._job(connection, previous)
-            if connection.execute("SELECT COUNT(*) FROM jobs WHERE status='queued'").fetchone()[0] >= max_queued:
+            if connection.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','waiting_auth')").fetchone()[0] >= max_queued:
                 raise OverflowError("The download queue is full")
             connection.execute("""INSERT INTO jobs(id,url,kind,profile,max_height,playlist,playlist_items,idempotency_key,created_at,updated_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?)""", (job_id,url,kind,profile,max_height,int(playlist),playlist_items,idempotency_key,stamp,stamp))
@@ -192,7 +192,7 @@ class Database:
             if row["status"] in TERMINAL:
                 return self._job(connection, row)
             stamp = utcnow()
-            if row["status"] == "queued":
+            if row["status"] in {"queued", "waiting_auth"}:
                 connection.execute("UPDATE jobs SET status='cancelled',phase='cancelled',cancel_requested=1,finished_at=?,updated_at=? WHERE id=?", (stamp,stamp,job_id))
             else:
                 connection.execute("UPDATE jobs SET cancel_requested=1,updated_at=? WHERE id=?", (stamp,job_id))
@@ -206,15 +206,52 @@ class Database:
                 raise KeyError(job_id)
             if row["status"] not in TERMINAL:
                 raise ValueError("Only completed, failed or cancelled jobs can be retried")
+            metadata = json.loads(row["metadata"])
+            # This is the user's explicit retry boundary. Automatic auth
+            # resumes and crash recovery deliberately retain this budget.
+            metadata.pop("_instagram_auth", None)
             connection.execute("""UPDATE jobs SET status='queued',phase='queued',cancel_requested=0,progress=NULL,
                 downloaded_bytes=0,total_bytes=NULL,speed=NULL,eta=NULL,error=NULL,error_code=NULL,
-                started_at=NULL,finished_at=NULL,heartbeat_at=NULL,updated_at=? WHERE id=?""", (utcnow(),job_id))
+                started_at=NULL,finished_at=NULL,heartbeat_at=NULL,metadata=?,updated_at=? WHERE id=?""", (json.dumps(metadata, ensure_ascii=False, allow_nan=False),utcnow(),job_id))
             self._event(connection, {"job_id": job_id})
             return self._job(connection, connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
     def active_jobs(self) -> list[dict]:
         with self.connection() as connection:
             return [self._job(connection, row) for row in connection.execute("SELECT * FROM jobs WHERE status NOT IN ('queued','completed','failed','cancelled')").fetchall()]
+
+    def resolve_waiting_auth(self, job_id: str, *, status: str, error: str | None = None,
+                             error_code: str | None = None) -> bool:
+        """Resolve only a still-waiting job; cancellation always wins the race."""
+        if status not in {"queued", "failed", "cancelled"}:
+            raise ValueError("Invalid authentication resolution")
+        with self.transaction() as connection:
+            row = connection.execute("SELECT status,cancel_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["status"] != "waiting_auth":
+                return False
+            if row["cancel_requested"]:
+                status, error, error_code = "cancelled", None, None
+            stamp = utcnow()
+            connection.execute("""UPDATE jobs SET status=?,phase=?,error=?,error_code=?,progress=NULL,
+                speed=NULL,eta=NULL,heartbeat_at=NULL,finished_at=?,updated_at=? WHERE id=?""",
+                (status,status,error,error_code,None if status == "queued" else stamp,stamp,job_id))
+            self._event(connection, {"job_id": job_id})
+            return True
+
+    def update_waiting_auth(self, job_id: str, **fields) -> bool:
+        if not fields or fields.keys() - {"metadata", "error", "error_code"}:
+            raise ValueError("Invalid authentication update")
+        if "metadata" in fields:
+            if not isinstance(fields["metadata"], dict):
+                raise ValueError("Job metadata must be an object")
+            fields["metadata"] = json.dumps(fields["metadata"], ensure_ascii=False, allow_nan=False)
+        fields["updated_at"] = utcnow()
+        with self.transaction() as connection:
+            changed = connection.execute("UPDATE jobs SET " + ",".join(f"{key}=?" for key in fields) +
+                " WHERE id=? AND status='waiting_auth' AND cancel_requested=0", (*fields.values(),job_id)).rowcount
+            if changed:
+                self._event(connection, {"job_id": job_id})
+            return bool(changed)
 
     def add_artifact(self, job_id, *, relative_path, name, size, mime, sha256) -> dict:
         if size < 0:
