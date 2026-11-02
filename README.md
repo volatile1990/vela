@@ -12,7 +12,7 @@ Die Anwendung verwendet Python/FastAPI, React/TypeScript/Vite und SQLite. API un
 
 Downloadziel ist `\\unas.home.arpa\Unprotected\Vela`, ein eigener Unterordner der gewünschten Freigabe. Die fehlende Redundanz dieses Speicherbereichs ist bewusst akzeptiert; Medienbackups gehören nicht zum Auftrag. Datenbank und temporäre Dateien bleiben auf dem Heimserver.
 
-Vela läuft unter **[https://vela.home.arpa/](https://vela.home.arpa/)** und ist in NEXUS verlinkt. Am 2. November 2026 wurden Vorschau, Video, Audio und ein öffentlicher YouTube-Download bis zur Datei auf dem UNAS einschließlich Hashprüfung bestätigt. Der Worker-Neustart ließ die API ohne Ausfall erreichbar. Die Linux-Prüfung besteht aus 61 Tests, die Frontend-Prüfung aus 18 Tests.
+Vela läuft unter **[https://vela.home.arpa/](https://vela.home.arpa/)** und ist in NEXUS verlinkt. Am 2. November 2026 wurden Vorschau, Video, Audio und ein öffentlicher YouTube-Download bis zur Datei auf dem UNAS einschließlich Hashprüfung bestätigt. Der Worker-Neustart ließ die API ohne Ausfall erreichbar. Die Linux-Prüfung besteht aus 161 Tests, die Frontend-Prüfung aus 18 Tests.
 
 Vela wird direkt auf dem Heimserver bereitgestellt. Eine Veröffentlichung in Orbit erfolgt ausschließlich auf ausdrücklichen Nutzerauftrag; der vorübergehend angelegte Katalogeintrag wurde auf Nutzerwunsch zurückgenommen.
 
